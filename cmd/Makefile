@@ -189,6 +189,17 @@ obj-$(CONFIG_HUSH_PARSER) += test.o
 obj-$(CONFIG_CMD_TPM) += tpm-common.o
 obj-$(CONFIG_CMD_TPM_V1) += tpm-v1.o
 obj-$(CONFIG_CMD_TPM_TEST) += tpm_test.o
+obj-$(CONFIG_TPM_WOLF) += wolftpm.o
+ifeq ($(CONFIG_TPM_WOLF),y)
+ifeq ($(CONFIG_TPM_V2),y)
+ccflags-y += -Ilib/wolftpm \
+             -I../include \
+             -Ilib/wolftpm/wolftpm \
+             -Iinclude/configs \
+             -DWOLFTPM_USER_SETTINGS \
+             -DWOLFTPM2_NO_WOLFCRYPT
+endif
+endif
 obj-$(CONFIG_CMD_TPM_V2) += tpm-v2.o
 obj-$(CONFIG_CMD_CROS_EC) += cros_ec.o
 obj-$(CONFIG_CMD_TSI148) += tsi148.o
