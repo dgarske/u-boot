@@ -6,6 +6,8 @@
 #ifndef _HASH_H
 #define _HASH_H
 
+#include <linux/types.h>
+
 #ifdef USE_HOSTCC
 #include <linux/kconfig.h>
 #endif
@@ -162,5 +164,20 @@ int hash_progressive_lookup_algo(const char *algo_name,
  * Return: 0 if ok, -EPROTONOSUPPORT for an unknown algorithm.
  */
 int hash_parse_string(const char *algo_name, const char *str, uint8_t *result);
+
+#ifdef WOLFTPM2_NO_WOLFCRYPT
+/**
+ * wc_Sha384Hash() - Calculate SHA384 hash
+ * @data:	Data to hash
+ * @len:	Length of data
+ * @hash:	Output buffer for hash
+ *
+ * This is a wrapper function to provide wolfCrypt-compatible SHA384 hashing
+ * when wolfCrypt is not available.
+ *
+ * Return: 0 on success, -1 on error
+ */
+int wc_Sha384Hash(const unsigned char* data, unsigned int len, unsigned char* hash);
+#endif /* WOLFTPM2_NO_WOLFCRYPT */
 
 #endif

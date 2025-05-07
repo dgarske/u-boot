@@ -392,6 +392,9 @@ The following options need to be configured:
 		CONFIG_TPM
 		Support TPM devices.
 
+		CONFIG_TPM_WOLF
+		Enables support for wolfTPM library.
+
 		CONFIG_TPM_TIS_INFINEON
 		Support for Infineon i2c bus TPM devices. Only one device
 		per system is supported at this time.

@@ -89,12 +89,6 @@
 #define le32_to_cpu __le32_to_cpu
 #define cpu_to_le16 __cpu_to_le16
 #define le16_to_cpu __le16_to_cpu
-#define cpu_to_be64 __cpu_to_be64
-#define be64_to_cpu __be64_to_cpu
-#define cpu_to_be32 __cpu_to_be32
-#define be32_to_cpu __be32_to_cpu
-#define cpu_to_be16 __cpu_to_be16
-#define be16_to_cpu __be16_to_cpu
 #define cpu_to_le64p __cpu_to_le64p
 #define le64_to_cpup __le64_to_cpup
 #define cpu_to_le32p __cpu_to_le32p
@@ -119,6 +113,31 @@
 #define be32_to_cpus __be32_to_cpus
 #define cpu_to_be16s __cpu_to_be16s
 #define be16_to_cpus __be16_to_cpus
+
+/*
+ * Check if byte-order functions are already defined by the system:
+ * wolfTPM, wolfCrypt, and U-boot all define these functions, so
+ * we need to check if they are already defined before defining
+ * them again.
+ */
+#ifndef cpu_to_be16
+#define cpu_to_be16 __cpu_to_be16
+#endif
+#ifndef cpu_to_be32
+#define cpu_to_be32 __cpu_to_be32
+#endif
+#ifndef cpu_to_be64
+#define cpu_to_be64 __cpu_to_be64
+#endif
+#ifndef be16_to_cpu
+#define be16_to_cpu __be16_to_cpu
+#endif
+#ifndef be32_to_cpu
+#define be32_to_cpu __be32_to_cpu
+#endif
+#ifndef be64_to_cpu
+#define be64_to_cpu __be64_to_cpu
+#endif
 
 /*
  * They have to be macros in order to do the constant folding

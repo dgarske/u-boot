@@ -53,6 +53,7 @@ obj-$(CONFIG_BITREVERSE) += bitrev.o
 obj-y += list_sort.o
 endif
 
+# U-boot TPM
 obj-$(CONFIG_$(PHASE_)TPM) += tpm-common.o
 ifeq ($(CONFIG_$(PHASE_)TPM),y)
 obj-$(CONFIG_TPM) += tpm_api.o
@@ -60,6 +61,25 @@ obj-$(CONFIG_TPM_V1) += tpm-v1.o
 obj-$(CONFIG_TPM_V2) += tpm-v2.o
 obj-$(CONFIG_EFI_TCG2_PROTOCOL) += tpm_tcg2.o
 obj-$(CONFIG_MEASURED_BOOT) += tpm_tcg2.o
+endif
+
+# wolfTPM with TPM 2.0 support (including TPM firmware update)
+ifeq ($(CONFIG_TPM_WOLF),y)
+ifeq ($(CONFIG_TPM_V2),y)
+ccflags-y += -Ilib/wolftpm \
+             -Iinclude/configs \
+             -DWOLFTPM_USER_SETTINGS \
+             -DWOLFTPM2_NO_WOLFCRYPT
+obj-y += wolftpm/hal/tpm_io.o
+obj-y += wolftpm/hal/tpm_io_uboot.o
+obj-y += wolftpm/src/tpm2_linux.o
+obj-y += wolftpm/src/tpm2.o
+obj-y += wolftpm/src/tpm2_packet.o
+obj-y += wolftpm/src/tpm2_tis.o
+obj-y += wolftpm/src/tpm2_wrap.o
+obj-y += wolftpm/src/tpm2_param_enc.o
+obj-y += wolftpm.o
+endif
 endif
 
 obj-$(CONFIG_$(PHASE_)CRC8) += crc8.o
