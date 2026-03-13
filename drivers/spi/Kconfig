@@ -119,6 +119,15 @@ config ATMEL_SPI
 	  many AT91 (ARM) chips. This driver can be used to access
 	  the SPI Flash, such as AT25DF321.
 
+config BCM2835_SPI
+	bool "BCM2835/BCM2711 SPI driver"
+	depends on ARCH_BCM283X
+	help
+	  Enable the BCM2835/BCM2711 SPI controller driver. This driver
+	  can be used to access SPI devices on Raspberry Pi boards
+	  including Pi 3 and Pi 4. It uses the hardware SPI controller
+	  rather than GPIO bit-banging.
+
 config BCM63XX_HSSPI
 	bool "BCM63XX HSSPI driver"
 	depends on (ARCH_BMIPS || ARCH_BCMBCA)
