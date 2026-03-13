@@ -234,7 +234,7 @@ int type_string_write_vars(const char *type_str, u8 *data,
 	return 0;
 }
 
-static int tpm_show_device(void)
+int tpm_show_device(void)
 {
 	struct udevice *dev;
 	char buf[80];
@@ -253,7 +253,7 @@ static int tpm_show_device(void)
 	return 0;
 }
 
-static int tpm_set_device(unsigned long num)
+int tpm_set_device(unsigned long num)
 {
 	struct udevice *dev;
 	unsigned long n = 0;

@@ -337,4 +337,26 @@ enum tpm_version tpm_get_version(struct udevice *dev);
 /* Iterate on all TPM devices */
 #define for_each_tpm_device(dev) uclass_foreach_dev_probe(UCLASS_TPM, (dev))
 
+/**
+ * tpm_show_device() - Show all TPM devices
+ *
+ * Return: 0 on success, -ve on failure
+ */
+int tpm_show_device(void);
+
+/**
+ * tpm_set_device() - Set the TPM device to use
+ *
+ * @num: The number of the TPM device to use
+ * Return: 0 on success, -ve on failure
+ */
+int tpm_set_device(unsigned long num);
+
+/**
+ * get_tpm() - Get the TPM device
+ *
+ * Return: 0 on success, -ve on failure
+ */
+int get_tpm(struct udevice **devp);
+
 #endif /* __TPM_COMMON_H */
