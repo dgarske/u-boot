@@ -158,6 +158,14 @@ config TPM2_TIS_SANDBOX
 	  such as basic configuration, PCR extension and PCR read. Extended
 	  functionalities are not implemented.
 
+config TPM2_SPI_SANDBOX
+	bool "Enable sandbox TPM SPI emulator"
+	depends on TPM_V2 && SANDBOX && DM_SPI
+	help
+	  This driver emulates a TPM connected via SPI for sandbox testing.
+	  It implements the TPM TIS SPI protocol and can be used to test
+	  wolfTPM SPI HAL code without physical hardware.
+
 config TPM2_TIS_SPI
 	bool "Enable support for TPMv2.x SPI chips"
 	depends on TPM_V2 && DM_SPI
@@ -199,6 +207,42 @@ config TPM2_EVENT_LOG_SIZE
 	  Define the size of the EventLog. Note that this is going to be
 	  allocated twice. One for the eventlog it self and one for the
 	  configuration table that is required from the TCG2 spec
+
+config TPM_AUTODETECT
+    bool "wolfTPM auto-detect TPM chip (for swtpm/QEMU)"
+    depends on TPM_V2 && TPM_WOLF
+    help
+      Enable wolfTPM chip auto-detection instead of using a specific
+      chip type (SLB9672/SLB9673). Use this for swtpm/QEMU testing
+      where no specific hardware chip is present.
+
+config WOLFTPM_LINUX_DEV
+    bool "Use device-level TPM interface (bypass wolfTPM TIS layer)"
+    depends on TPM_V2 && TPM_WOLF
+    default y
+    help
+      Enable wolfTPM to use the underlying TPM driver instead of its own
+      TIS (TPM Interface Specification) layer. On U-Boot, this uses the
+      U-Boot TPM driver model (tpm_xfer). On Linux, this uses /dev/tpm0.
+      This is the recommended setting for U-Boot.
+
+config WOLFTPM_SLB9672
+    bool "Enable support for Infineon SLB9672 TPM"
+    depends on TPM_V2 && TPM_WOLF
+    help
+      Enable support for Infineon SLB9672 TPM features in wolfTPM.
+
+config WOLFTPM_SLB9673
+    bool "Enable support for Infineon SLB9673 TPM"
+    depends on TPM_V2 && TPM_WOLF
+    help
+      Enable support for Infineon SLB9673 TPM features in wolfTPM.
+
+config WOLFTPM_FIRMWARE_UPGRADE
+    bool "Enable firmware upgrade support for wolfTPM"
+    depends on TPM_V2 && TPM_WOLF
+    help
+      Enable support for Infineon TPM firmware upgrade commands in wolfTPM.
 
 endif # TPM_V2
 
