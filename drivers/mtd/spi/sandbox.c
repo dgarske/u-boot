@@ -571,16 +571,28 @@ int sandbox_spi_get_emul(struct sandbox_state *state,
 
 	info = &state->spi[busnum][cs];
 	if (!info->emul) {
-		/* Use the same device tree node as the SPI flash device */
-		debug("%s: busnum=%u, cs=%u: binding SPI flash emulation: ",
-		      __func__, busnum, cs);
-		ret = sandbox_sf_bind_emul(state, busnum, cs, bus,
-					   dev_ofnode(slave), slave->name);
-		if (ret) {
-			debug("failed (err=%d)\n", ret);
-			return ret;
+		struct udevice *emul;
+		ofnode node = dev_ofnode(slave);
+
+		/* First check for sandbox,emul phandle property */
+		ret = uclass_get_device_by_phandle(UCLASS_SPI_EMUL, slave,
+						   "sandbox,emul", &emul);
+		if (!ret) {
+			debug("%s: busnum=%u, cs=%u: using phandle emulator\n",
+			      __func__, busnum, cs);
+			info->emul = emul;
+		} else {
+			/* Fall back to SPI flash emulation binding */
+			debug("%s: busnum=%u, cs=%u: binding SPI flash emulation: ",
+			      __func__, busnum, cs);
+			ret = sandbox_sf_bind_emul(state, busnum, cs, bus,
+						   node, slave->name);
+			if (ret) {
+				debug("failed (err=%d)\n", ret);
+				return ret;
+			}
+			debug("OK\n");
 		}
-		debug("OK\n");
 	}
 	*emulp = info->emul;
 
