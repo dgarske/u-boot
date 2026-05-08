@@ -17,7 +17,7 @@ set -e
 print_usage() {
     echo "usage: $0 <op> <subtree-name> <ref>"
     echo "  <op>           pull or pick"
-    echo "  <subtree-name> mbedtls or dts or lwip"
+    echo "  <subtree-name> mbedtls or dts or lwip or wolftpm"
     echo "  <ref>          release tag [pull] or commit id [pick]"
 }
 
@@ -46,6 +46,11 @@ set_params() {
             path=lib/lwip/lwip
             repo_url=https://git.savannah.gnu.org/git/lwip.git
             remote_name="lwip_upstream"
+            ;;
+        wolftpm)
+            path=lib/wolftpm
+            repo_url=https://github.com/wolfssl/wolfTPM.git
+            remote_name="wolftpm_upstream"
             ;;
         *)
             echo "Invalid subtree name: $subtree_name"
