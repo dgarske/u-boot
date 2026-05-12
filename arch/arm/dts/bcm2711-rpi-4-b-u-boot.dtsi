@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * U-Boot-only additions for Raspberry Pi 4 Model B
+ *
+ * Adds a TPM 2.0 device tree node on SPI0 CE1 for the Infineon
+ * SLB9670 / SLB9672 TPM HAT (electrically identical pinout to
+ * the Linux tpm-slb9670 overlay).
+ *
+ * The node lives in *-u-boot.dtsi rather than in bcm2711-rpi-4-b.dts
+ * so it is only visible to U-Boot's bundled FDT and never pollutes
+ * the upstream Linux DT or a SystemReady firmware-provided FDT.
+ */
+
+#include "bcm283x-u-boot.dtsi"
+
+/ {
+	aliases {
+		spi0 = &spi;
+	};
+};
+
+&gpio {
+	bootph-all;
+};
+
+&spi {
+	status = "okay";
+	bootph-all;
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_gpio7>;
+
+	/* Infineon SLB9670 / SLB9672 TPM 2.0 on CE1 (GPIO7) */
+	tpm@1 {
+		compatible = "infineon,slb9670", "tcg,tpm_tis-spi";
+		reg = <1>;
+		spi-max-frequency = <32000000>;
+		bootph-all;
+	};
+};
