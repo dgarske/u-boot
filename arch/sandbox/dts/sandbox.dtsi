@@ -286,6 +286,17 @@
 			spi-max-frequency = <40000000>;
 			sandbox,filename = "spi.bin";
 		};
+
+		tpm_spi: tpm@1 {
+			reg = <1>;
+			compatible = "sandbox,tpm-spi";
+			spi-max-frequency = <10000000>;
+			sandbox,emul = <&tpm_spi_emul>;
+		};
+	};
+
+	tpm_spi_emul: tpm-spi-emul {
+		compatible = "sandbox,tpm-spi-emul";
 	};
 
 	spl-test {
