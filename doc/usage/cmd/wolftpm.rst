@@ -40,6 +40,13 @@ PCR Operations
 - ``pcr_setauthpolicy | pcr_setauthvalue <pcr> <key> [<password>]`` - Change PCR access key
 - ``pcr_print`` - Print current PCR state
 
+Certificates
+~~~~~~~~~~~~
+
+- ``nv_read_cert <index> [<addr>]`` - Read the X.509 certificate stored in an NV index
+  (for example an EK or device identity certificate) and print its subject and issuer
+  - ``[<addr>]``: optional address to copy the DER certificate to; sets ``filesize``
+
 Security Management
 ~~~~~~~~~~~~~~~~~~~
 
@@ -209,6 +216,10 @@ Enable wolfTPM support in U-Boot by adding these options to your board's defconf
   if with __LINUX__:
     CONFIG_TPM_LINUX_DEV=y
 
+``CONFIG_WOLFTPM_COMMAND_RETRIES`` (default 3) sets how many times wolfTPM resends a
+command that the TPM answers with ``TPM_RC_RETRY``, as swtpm does on the first
+authorized read of an NV index.
+
 Or use ``make menuconfig`` and enable:
 
 Enabling Debug Output
@@ -322,6 +333,21 @@ To build and run wolfTPM with U-Boot using QEMU and a TPM simulator, follow thes
 
 8. Exiting the QEMU:
    Press Ctrl-A followed by X
+
+Steps 3 to 5 can be replaced by ``tools/wolftpm-qemu-swtpm.sh``, which starts swtpm,
+provisions a self-signed test certificate into NV index 0x01c00002 (needs openssl and
+tpm2-tools), and runs QEMU. Build with ``CONFIG_CMD_WOLFTPM`` and
+``CONFIG_TPM_AUTODETECT`` enabled first::
+
+     tools/wolftpm-qemu-swtpm.sh u-boot.bin
+     => tpm2 autostart
+     => tpm2 nv_read_cert 0x01c00002
+     NV index 0x01c00002: 440 bytes
+     Subject: CN=wolfTPM QEMU Test serialNumber=TEST0001
+     Issuer: CN=wolfTPM QEMU Test serialNumber=TEST0001
+
+Set ``WOLFTPM_NO_CERT=1`` to skip provisioning, and ``WOLFTPM_CERT_INDEX`` or
+``WOLFTPM_CERT_SUBJ`` to change the index or subject.
 
 Testing wolfTPM
 ---------------
@@ -550,46 +576,40 @@ Install swtpm and QEMU::
 
    ``u-boot-test-console`` (starts swtpm + QEMU)::
 
-     #!/bin/bash
-     SWTPM_DIR=/tmp/mytpm
-     SWTPM_SOCK=${SWTPM_DIR}/swtpm-sock
-     mkdir -p ${SWTPM_DIR}
-     if [ ! -S "${SWTPM_SOCK}" ]; then
-         swtpm socket --tpm2 --tpmstate dir=${SWTPM_DIR} \
-             --ctrl type=unixio,path=${SWTPM_SOCK} --log level=0 &
-         sleep 1
-     fi
-     exec qemu-system-aarch64 -machine virt -nographic -cpu cortex-a57 \
-         -bios u-boot.bin \
-         -chardev socket,id=chrtpm,path=${SWTPM_SOCK} \
-         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-         -device tpm-tis-device,tpmdev=tpm0
+     #!/bin/sh
+     exec tools/wolftpm-qemu-swtpm.sh "$U_BOOT_BUILD_DIR/u-boot.bin"
 
    ``u-boot-test-reset`` (no-op)::
 
      #!/bin/bash
      exit 0
 
-   ``u-boot-test-release`` (cleanup)::
+   ``u-boot-test-release`` (no-op, the script stops swtpm on exit)::
 
      #!/bin/bash
-     pkill -f "swtpm.*mytpm" 2>/dev/null
      exit 0
 
    Make them executable::
 
      chmod +x u-boot-test-flash u-boot-test-console u-boot-test-reset u-boot-test-release
 
+   To also run ``test_wolftpm_nv_read_cert``, add a ``u_boot_boardenv_qemu_arm64.py``
+   on ``PYTHONPATH`` with::
+
+     env__wolftpm_nv_cert = {'index': '0x01c00002',
+                             'subject': 'CN=wolfTPM QEMU Test'}
+
 3. Run the wolfTPM Python tests::
 
      export PATH=".:$PATH"
      ./test/py/test.py --bd qemu_arm64 --build-dir . -k "test_wolftpm and not ut_cmd" -v
 
-**Verified output (QEMU arm64 + swtpm, 19 passed, 2 skipped):**
+**Verified output (QEMU arm64 + swtpm, 20 passed, 2 skipped):**
 
 ::
 
     test_wolftpm_autostart PASSED
+    test_wolftpm_nv_read_cert PASSED
     test_wolftpm_init PASSED
     test_wolftpm_self_test_full PASSED
     test_wolftpm_self_test_continue PASSED

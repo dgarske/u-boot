@@ -15,6 +15,10 @@ Notes:
 
 Configuration:
 * Set env__wolftpm_device_test_skip to True to skip these tests.
+* Set env__wolftpm_nv_cert to a dict with 'index' and 'subject' to test
+  tpm2 nv_read_cert, for example with tools/wolftpm-qemu-swtpm.sh:
+  env__wolftpm_nv_cert = {'index': '0x01c00002',
+                          'subject': 'CN=wolfTPM QEMU Test'}
 """
 
 import os.path
@@ -56,6 +60,36 @@ def test_wolftpm_autostart(ubman):
     ubman.run_command('tpm2 autostart')
     output = ubman.run_command('echo $?')
     assert output.endswith('0')
+
+
+@pytest.mark.buildconfigspec('tpm_wolf')
+def test_wolftpm_nv_read_cert(ubman):
+    """Test wolfTPM nv_read_cert command.
+
+    Read a provisioned X.509 certificate from NV, check the printed subject
+    and that the DER copied to memory starts with a SEQUENCE. The index
+    should be platform-created so that 'tpm2 clear' does not delete it.
+    """
+    skip_test = ubman.config.env.get('env__wolftpm_device_test_skip', False)
+    if skip_test:
+        pytest.skip('skip wolfTPM device test')
+    nv_cert = ubman.config.env.get('env__wolftpm_nv_cert', None)
+    if not nv_cert:
+        pytest.skip('env__wolftpm_nv_cert not configured')
+    ram = utils.find_ram_base(ubman)
+
+    ubman.run_command('tpm2 autostart')
+    output = ubman.run_command('tpm2 nv_read_cert %s 0x%x' %
+                               (nv_cert['index'], ram))
+    assert 'Subject: %s' % nv_cert['subject'] in output
+    output = ubman.run_command('echo $?')
+    assert output.endswith('0')
+    output = ubman.run_command('md.b 0x%x 1' % ram)
+    assert ': 30' in output
+
+    ubman.run_command('tpm2 nv_read_cert 0x01ffffff')
+    output = ubman.run_command('echo $?')
+    assert output.endswith('1')
 
 
 @pytest.mark.buildconfigspec('tpm_wolf')
