@@ -37,6 +37,7 @@ static struct cmd_tbl tpm2_commands[] = {
 #ifdef CONFIG_TPM_WOLF
 	U_BOOT_CMD_MKENT(caps, 0, 1, do_tpm2_caps, "", ""),
 	U_BOOT_CMD_MKENT(pcr_print, 0, 1, do_tpm2_pcr_print, "", ""),
+	U_BOOT_CMD_MKENT(nv_read_cert, 0, 1, do_tpm2_nv_read_cert, "", ""),
 #ifdef WOLFTPM_FIRMWARE_UPGRADE
 #if defined(WOLFTPM_SLB9672) || defined(WOLFTPM_SLB9673)
 	U_BOOT_CMD_MKENT(firmware_update, 0, 1,
@@ -164,6 +165,10 @@ U_BOOT_CMD(tpm2, CONFIG_SYS_MAXARGS, 1, do_tpm2, "Issue a TPMv2.x command",
 "    Show TPM capabilities and info\n"
 "pcr_print\n"
 "    Prints the current PCR state\n"
+"nv_read_cert <index> [<addr>]\n"
+"    Read the X.509 certificate stored in NV <index> and print its\n"
+"    subject and issuer. If <addr> is given, also copy the DER there\n"
+"    and set filesize.\n"
 #ifdef WOLFTPM_FIRMWARE_UPGRADE
 #if defined(WOLFTPM_SLB9672) || defined(WOLFTPM_SLB9673)
 "firmware_update <manifest_addr> <manifest_sz> <firmware_addr> <firmware_sz>\n"

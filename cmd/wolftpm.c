@@ -19,12 +19,15 @@
 
 #include <hal/tpm_io.h>
 #include <examples/wrap/wrap_test.h>
+#include <wolftpm/tpm2_asn.h>
 
 /* U-boot specific includes */
 #include <command.h>
 #include <tpm-common.h>
 #include <vsprintf.h>
 #include <mapmem.h>
+#include <env.h>
+#include <malloc.h>
 #include <errno.h>
 #include <log.h>
 #include <string.h>
@@ -1035,6 +1038,98 @@ int do_tpm2_pcr_print(struct cmd_tbl *cmdtp, int flag, int argc, char *const arg
 	log_debug("tpm2 pcr_print: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
 	return rc;
+}
+
+static void tpm2_print_name(const char *label, const byte *name, word32 nameSz)
+{
+	static const struct {
+		const char *str;
+		byte oid[3];
+	} attrs[] = {
+		{ "CN", { 0x55, 0x04, 0x03 } },
+		{ "serialNumber", { 0x55, 0x04, 0x05 } },
+		{ "O", { 0x55, 0x04, 0x0a } },
+		{ "OU", { 0x55, 0x04, 0x0b } },
+	};
+	const byte *val;
+	word32 valSz;
+	int i;
+
+	printf("%s:", label);
+	for (i = 0; i < ARRAY_SIZE(attrs); i++) {
+		if (TPM2_ASN_GetNameAttr(name, nameSz, attrs[i].oid,
+					 sizeof(attrs[i].oid), &val, &valSz) == 0)
+			printf(" %s=%.*s", attrs[i].str, (int)valSz, val);
+	}
+	printf("\n");
+}
+
+int do_tpm2_nv_read_cert(struct cmd_tbl *cmdtp, int flag, int argc,
+			 char *const argv[])
+{
+	int rc;
+	WOLFTPM2_DEV dev;
+	DecodedX509 x509;
+	TPM_HANDLE handle;
+	ulong addr = 0;
+	uint32_t size = 0;
+	byte *buf = NULL;
+
+	if (argc < 2 || argc > 3)
+		return CMD_RET_USAGE;
+
+	handle = simple_strtoul(argv[1], NULL, 0);
+	if (argc == 3)
+		addr = simple_strtoul(argv[2], NULL, 0);
+
+	rc = TPM2_Init_Device(&dev, NULL);
+	if (rc != TPM_RC_SUCCESS) {
+		printf("Couldn't init TPM (rc=%d: %s)\n", rc,
+		       TPM2_GetRCString(rc));
+		return CMD_RET_FAILURE;
+	}
+
+	/* A NULL buffer only returns the size of the NV index */
+	rc = wolfTPM2_NVReadCert(&dev, handle, NULL, &size);
+	if (rc == TPM_RC_SUCCESS && size == 0)
+		rc = BUFFER_E;
+	if (rc == TPM_RC_SUCCESS) {
+		buf = argc == 3 ? map_sysmem(addr, size) : malloc(size);
+		if (!buf)
+			rc = MEMORY_E;
+	}
+	if (rc == TPM_RC_SUCCESS)
+		rc = wolfTPM2_NVReadCert(&dev, handle, buf, &size);
+
+	if (rc == TPM_RC_SUCCESS) {
+		printf("NV index 0x%08x: %u bytes\n", handle, size);
+		memset(&x509, 0, sizeof(x509));
+		if (TPM2_ASN_DecodeX509Cert(buf, size, &x509) == 0) {
+			tpm2_print_name("Subject", x509.subject,
+					x509.subjectSz);
+			tpm2_print_name("Issuer", x509.issuer, x509.issuerSz);
+		} else {
+			printf("Not an X.509 certificate\n");
+		}
+		if (argc == 3)
+			env_set_hex("filesize", size);
+	}
+
+	if (argc == 3) {
+		if (buf)
+			unmap_sysmem(buf);
+	} else {
+		free(buf);
+	}
+	wolfTPM2_Cleanup(&dev);
+
+	if (rc != TPM_RC_SUCCESS) {
+		printf("Couldn't read certificate from NV index 0x%08x (rc=%d: %s)\n",
+		       handle, rc, TPM2_GetRCString(rc));
+		return CMD_RET_FAILURE;
+	}
+
+	return CMD_RET_SUCCESS;
 }
 
 int do_tpm2_dam_reset(struct cmd_tbl *cmdtp, int flag,

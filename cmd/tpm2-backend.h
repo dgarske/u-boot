@@ -53,6 +53,8 @@ int do_tpm2_caps(struct cmd_tbl *cmdtp, int flag, int argc,
 		 char *const argv[]);
 int do_tpm2_pcr_print(struct cmd_tbl *cmdtp, int flag, int argc,
 		      char *const argv[]);
+int do_tpm2_nv_read_cert(struct cmd_tbl *cmdtp, int flag, int argc,
+			 char *const argv[]);
 #ifdef WOLFTPM_FIRMWARE_UPGRADE
 #if defined(WOLFTPM_SLB9672) || defined(WOLFTPM_SLB9673)
 int do_tpm2_firmware_update(struct cmd_tbl *cmdtp, int flag, int argc,
