@@ -1,0 +1,428 @@
+/* tpm2_asn.c
+ *
+ * Copyright (C) 2006-2026 wolfSSL Inc.
+ *
+ * This file is part of wolfTPM.
+ *
+ * wolfTPM is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * wolfTPM is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
+#ifdef HAVE_CONFIG_H
+    #include <config.h>
+#endif
+
+#include <wolftpm/tpm2_asn.h>
+#include <wolftpm/tpm2_wrap.h>
+
+#ifndef WOLFTPM2_NO_ASN
+
+/* Helper to trim leading zeros when not required  */
+byte* TPM2_ASN_TrimZeros(byte* in, word32* len)
+{
+    word32 idx = 0;
+    while (idx+1 < *len && in[idx] == 0 && (in[idx+1] & 0x80) == 0) {
+        idx++;
+        in++;
+    }
+    *len -= idx;
+    return in;
+}
+
+int TPM2_ASN_GetLength_ex(const uint8_t* input, word32* inOutIdx, int* len,
+                           word32 maxIdx, int check)
+{
+    int     length = 0;
+    word32  idx = *inOutIdx;
+    byte    b;
+
+    *len = 0;    /* default length */
+
+    if ((idx + 1) > maxIdx) {
+        return TPM_RC_INSUFFICIENT;
+    }
+
+    b = input[idx++];
+    if (b >= TPM2_ASN_LONG_LENGTH) {
+        word32 bytes = b & 0x7F;
+        /* DER does not allow BER indefinite-length (0x80 => bytes == 0) */
+        if (bytes == 0 || bytes > 3 || (idx + bytes) > maxIdx) {
+            return TPM_RC_INSUFFICIENT;
+        }
+        while (bytes--) {
+            b = input[idx++];
+            length = (length << 8) | b;
+        }
+    }
+    else
+        length = b;
+
+    if (check && (idx + length) > maxIdx) {
+        return TPM_RC_INSUFFICIENT;
+    }
+
+    *inOutIdx = idx;
+    if (length > 0)
+        *len = length;
+
+    return length;
+}
+
+int TPM2_ASN_GetLength(const uint8_t* input, word32* inOutIdx, int* len,
+                           word32 maxIdx)
+{
+    return TPM2_ASN_GetLength_ex(input, inOutIdx, len, maxIdx, 1);
+}
+
+/*!
+    \ingroup ASN
+    \brief Decodes ASN.1 tag and length
+    \param input Buffer containing ASN.1 data
+    \param tag Expected ASN.1 tag value
+    \param inOutIdx Current position in buffer, updated to new position
+    \param len Decoded length value
+    \param maxIdx Maximum allowed index in buffer
+    \return Length on success, TPM_RC_VALUE on tag mismatch, TPM_RC_INSUFFICIENT on buffer error
+*/
+static int TPM2_ASN_GetHeader(const uint8_t* input, byte tag, word32* inOutIdx, int* len,
+                        word32 maxIdx)
+{
+    word32 idx = *inOutIdx;
+    byte   b;
+    int    length;
+
+    if ((idx + 1) > maxIdx)
+        return TPM_RC_INSUFFICIENT;
+
+    b = input[idx++];
+    if (b != tag)
+        return TPM_RC_VALUE;
+
+    if (TPM2_ASN_GetLength(input, &idx, &length, maxIdx) < 0)
+        return TPM_RC_VALUE;
+
+    *len      = length;
+    *inOutIdx = idx;
+    return length;
+}
+
+int TPM2_ASN_DecodeTag(const uint8_t* input, int inputSz,
+    int* inOutIdx, int* tag_len, uint8_t tag)
+{
+    word32 idx = *inOutIdx;
+    int rc = TPM2_ASN_GetHeader(input, tag, &idx, tag_len, inputSz);
+    if (rc >= 0) {
+        *inOutIdx = idx;
+        rc = 0;
+    }
+    return rc;
+}
+
+int TPM2_ASN_RsaDecodeSignature(uint8_t** pInput, int inputSz)
+{
+    int rc;
+    uint8_t* input = *pInput;
+    int idx = 0;
+    int tot_len, algo_len, digest_len = 0;
+
+    rc = TPM2_ASN_DecodeTag(input, inputSz, &idx, &tot_len,
+        (TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED));
+    if (rc == 0) {
+        rc = TPM2_ASN_DecodeTag(input, inputSz, &idx, &algo_len,
+            (TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED));
+    }
+    if (rc == 0) {
+        idx += algo_len;
+        rc = TPM2_ASN_DecodeTag(input, inputSz, &idx, &digest_len, TPM2_ASN_OCTET_STRING);
+    }
+    if (rc == 0) {
+        *pInput = &input[idx];
+        rc = digest_len;
+    }
+    return rc;
+}
+
+int TPM2_ASN_DecodeX509Cert(uint8_t* input, int inputSz,
+    DecodedX509* x509)
+{
+    int rc = 0;
+    word32 idx = 0, sigAlgEnd = 0;
+    word32 tbsSigAlgBegin = 0, tbsSigAlgSz = 0;
+    word32 outerSigAlgBegin = 0, outerSigAlgSz = 0;
+    int tot_len, cert_len = 0, len, pubkey_len = 0, sig_len = 0;
+    byte sigParamTag = 0;
+
+    if (input == NULL || x509 == NULL) {
+        rc = TPM_RC_VALUE;
+    }
+
+    /* Decode outer SEQUENCE */
+    if (rc == 0) {
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &tot_len, inputSz);
+    }
+
+    /* Store certificate location */
+    if (rc >= 0) {
+        x509->certBegin = idx;
+        x509->cert = &input[idx];
+
+        /* Decode certificate SEQUENCE */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &cert_len, inputSz);
+    }
+
+    if (rc >= 0) {
+        x509->certSz = cert_len + (idx - x509->certBegin);
+
+        /* Decode version */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_CONTEXT_SPECIFIC | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        if (len <= 0 || idx >= (word32)inputSz) {
+            rc = TPM_RC_VALUE;
+        }
+    }
+
+    if (rc >= 0) {
+        /* check version tag is INTEGER */
+        if (input[idx] != TPM2_ASN_INTEGER) {
+            rc = TPM_RC_VALUE;
+        }
+    }
+
+    if (rc >= 0) {
+        idx += len; /* skip version */
+
+        /* Skip serial number */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_INTEGER, &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        idx += len; /* skip serial */
+
+        /* Skip algorithm identifier */
+        tbsSigAlgBegin = idx;
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        tbsSigAlgSz = idx - tbsSigAlgBegin + (word32)len;
+        idx += len; /* skip signature oid */
+
+        /* Skip issuer */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        idx += len; /* skip issuer */
+
+        /* Skip validity */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        idx += len; /* skip validity */
+
+        /* Skip subject */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        idx += len; /* skip subject */
+        /* subject public key info */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+    if (rc >= 0) {
+        /* cert - subject public key alg oid */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+    }
+    if (rc >= 0) {
+        idx += len; /* skip alg oid */
+        /* Get public key */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_BIT_STRING, &idx, &pubkey_len, inputSz);
+    }
+
+    if (rc >= 0) {
+        /* skip leading zero for bit string */
+        if (pubkey_len > 0 && input[idx] == 0x00) {
+            idx++;
+            pubkey_len--;
+        }
+        x509->publicKey = &input[idx];
+        x509->pubKeySz = pubkey_len;
+
+        /* Get signature algorithm */
+        idx = x509->certBegin + x509->certSz;
+        outerSigAlgBegin = idx;
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED,
+                               &idx, &len, inputSz);
+        if (rc >= 0) {
+            sigAlgEnd = idx + (word32)len;
+            outerSigAlgSz = sigAlgEnd - outerSigAlgBegin;
+            if (outerSigAlgSz != tbsSigAlgSz ||
+                    XMEMCMP(input + outerSigAlgBegin,
+                        input + tbsSigAlgBegin, outerSigAlgSz) != 0) {
+                rc = TPM_RC_VALUE;
+            }
+        }
+    }
+
+    if (rc >= 0) {
+        /* signature oid */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_OBJECT_ID, &idx, &len, inputSz);
+    }
+
+    if (rc >= 0) {
+        idx += len; /* skip oid */
+        if (idx < sigAlgEnd) {
+            sigParamTag = input[idx];
+            if (sigParamTag != TPM2_ASN_TAG_NULL &&
+                    sigParamTag !=
+                        (TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED)) {
+                rc = TPM_RC_VALUE;
+            }
+            else {
+                rc = TPM2_ASN_GetHeader(input, sigParamTag, &idx, &len,
+                    sigAlgEnd);
+                if (rc >= 0 && sigParamTag == TPM2_ASN_TAG_NULL && len != 0) {
+                    rc = TPM_RC_VALUE;
+                }
+                if (rc >= 0) {
+                    idx += len;
+                }
+            }
+        }
+        if (rc >= 0 && idx != sigAlgEnd) {
+            rc = TPM_RC_VALUE;
+        }
+    }
+
+    if (rc >= 0) {
+        /* Get signature */
+        rc = TPM2_ASN_GetHeader(input, TPM2_ASN_BIT_STRING, &idx, &sig_len,
+            inputSz);
+    }
+
+    if (rc >= 0) {
+        /* skip leading zero for bit string */
+        if (sig_len > 0 && input[idx] == 0x00) {
+            idx++;
+            sig_len--;
+        }
+        /* signature */
+        x509->sigSz = sig_len;
+        x509->signature = &input[idx];
+        rc = TPM_RC_SUCCESS;
+        }
+    return rc;
+}
+
+int TPM2_ASN_DecodeRsaPubKey(uint8_t* input, int inputSz,
+    TPM2B_PUBLIC* pub)
+{
+    int rc;
+    int idx = 0;
+    int tot_len, mod_len = 0, exp_len = 0;
+
+    rc = TPM2_ASN_DecodeTag(input, inputSz, &idx, &tot_len,
+        (TPM2_ASN_SEQUENCE | TPM2_ASN_CONSTRUCTED));
+    if (rc == 0) {
+        rc = TPM2_ASN_DecodeTag(input, inputSz, &idx, &mod_len, TPM2_ASN_INTEGER);
+    }
+    if (rc == 0) {
+        /* Validate mod_len and idx before accessing input buffer. Without
+         * this guard a length-0 INTEGER followed by no bytes would let
+         * mod_len underflow from 0 to -1 below, bypassing the size check
+         * via signed comparison and passing SIZE_MAX to XMEMCPY. */
+        if (mod_len <= 0 || idx >= inputSz) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        if (input[idx] == 0x00) {
+            idx++;
+            mod_len--;
+        }
+        if (mod_len > (int)sizeof(pub->publicArea.unique.rsa.buffer)) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        pub->publicArea.parameters.rsaDetail.keyBits = mod_len * 8;
+        pub->publicArea.unique.rsa.size = mod_len;
+        XMEMCPY(pub->publicArea.unique.rsa.buffer, &input[idx], mod_len);
+    }
+    if (rc == 0) {
+        idx += mod_len;
+        rc = TPM2_ASN_DecodeTag(input, inputSz, &idx, &exp_len, TPM2_ASN_INTEGER);
+    }
+    if (rc == 0) {
+        /* Validate exp_len and idx before accessing input buffer */
+        if (exp_len <= 0 || idx >= inputSz) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        if (input[idx] == 0x00) {
+            idx++;
+            exp_len--;
+        }
+        if (exp_len > (int)sizeof(pub->publicArea.parameters.rsaDetail.exponent)) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        pub->publicArea.parameters.rsaDetail.exponent =
+            wolfTPM2_RsaKey_Exponent(&input[idx], exp_len);
+    }
+    return rc;
+}
+
+int TPM2_ASN_RsaUnpadPkcsv15(uint8_t** pSig, int* sigSz)
+{
+    int rc = -1;
+    uint8_t* sig = *pSig;
+    int idx = 0;
+
+    if (*sigSz < 3)
+        return rc;
+
+    if (sig[idx++] == 0x00 && sig[idx++] == 0x01) {
+        while (idx < *sigSz) {
+            if (sig[idx] != 0xFF)
+                break;
+            idx++;
+        }
+        /* Require the null separator to be in bounds (avoids a 1-byte
+         * over-read) and at least 8 padding bytes per PKCS#1 v1.5 Sec.9.2
+         * (also rejects the all-0xFF Bleichenbacher variant). */
+        if (idx < *sigSz && (idx - 2) >= 8 && sig[idx++] == 0x00) {
+            rc = 0;
+            *pSig = &sig[idx];
+            *sigSz -= idx;
+        }
+    }
+    return rc;
+}
+
+#endif /* !WOLFTPM2_NO_ASN */

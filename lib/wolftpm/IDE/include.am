@@ -1,0 +1,9 @@
+# vim:ft=automake
+# included from Top Level Makefile.am
+# All paths should be given relative to the root
+
+include IDE/STM32CUBE/include.am
+include IDE/IAR-EWARM/include.am
+include IDE/QNX/include.am
+include IDE/VisualStudio/include.am
+include IDE/Espressif/include.am

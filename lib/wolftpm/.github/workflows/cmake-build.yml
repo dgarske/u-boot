@@ -1,0 +1,285 @@
+name: WolfTPM CMake Build Tests
+
+on:
+  push:
+    branches: [ 'master', 'main', 'release/**' ]
+  pull_request:
+    branches: [ '*' ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  repository_dispatch:
+    types: [nightly-trigger]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          # Default configuration (SWTPM first)
+          - name: "Defaults"
+            os: ubuntu-latest
+            options: ""
+          # ST33 supports both SPI and I2C
+          - name: "Module ST33 SPI"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_MODULE=st33"
+          - name: "Module ST33 I2C"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=I2C -DWOLFTPM_MODULE=st33"
+          # ST33 Firmware
+          - name: "Module ST33 Firmware"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_MODULE=st33 -DWOLFTPM_FIRMWARE=yes"
+          # Other modules use SPI
+          - name: "Module Microchip"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_MODULE=microchip"
+          - name: "Module Nuvoton"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_MODULE=nuvoton"
+          - name: "Module SLB9670"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_MODULE=slb9670"
+          - name: "Module SLB9672"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_MODULE=slb9672"
+          # SLB9673 is I2C
+          - name: "Module SLB9673 I2C"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=I2C -DWOLFTPM_MODULE=slb9673"
+          # Test wrapper disabled
+          - name: "No Wrapper"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_WRAPPER=no"
+          # Test I2C support (enables ADV_IO automatically)
+          - name: "I2C Enabled (legacy)"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_I2C=yes"
+          # Test interface options
+          - name: "Interface I2C"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=I2C"
+          - name: "Interface SPI"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI"
+          # Test Advanced IO
+          - name: "Advanced IO"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_ADVIO=yes"
+          - name: "Advanced IO I2C"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=I2C -DWOLFTPM_ADVIO=yes"
+          # Test MMIO (enables ADV_IO automatically)
+          - name: "MMIO Enabled"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_MMIO=yes"
+          # Test Check Wait State
+          - name: "Check Wait State Enabled"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_CHECK_WAIT_STATE=yes"
+          - name: "Check Wait State Disabled"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_CHECK_WAIT_STATE=no"
+          # Test TIS Lock
+          - name: "TIS Lock Enabled"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_TIS_LOCK=yes"
+          # Test Small Stack
+          - name: "Small Stack"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=SPI -DWOLFTPM_SMALL_STACK=yes"
+          # Test HAL disabled
+          - name: "No HAL"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_HAL=no"
+          # Test Firmware disabled
+          - name: "No Firmware"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_FIRMWARE=no"
+          # Test Debug modes
+          - name: "Debug Verbose"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_DEBUG=verbose"
+          - name: "Debug IO"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_DEBUG=io"
+          # Test Examples disabled
+          - name: "No Examples"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_EXAMPLES=no"
+          # Test combination of options
+          - name: "Combined Options"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_INTERFACE=I2C -DWOLFTPM_MODULE=st33 -DWOLFTPM_ADVIO=yes -DWOLFTPM_CHECK_WAIT_STATE=yes"
+          # fwTPM server with socket transport
+          - name: "fwTPM Socket"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_FWTPM=yes -DWOLFTPM_INTERFACE=SWTPM"
+          # fwTPM server with TIS/shared-memory transport
+          - name: "fwTPM TIS"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_FWTPM=yes -DWOLFTPM_INTERFACE=SPI"
+          # fwTPM server-only mode (no client library or examples)
+          - name: "fwTPM Only"
+            os: ubuntu-latest
+            options: "-DWOLFTPM_FWTPM_ONLY=yes -DWOLFTPM_INTERFACE=SWTPM"
+          # fwTPM socket on Windows (build-only)
+          - name: "fwTPM Socket (Windows)"
+            os: windows-latest
+            options: "-DWOLFTPM_FWTPM=yes -DWOLFTPM_INTERFACE=SWTPM"
+
+    steps:
+#pull wolfTPM
+    - uses: actions/checkout@master
+
+# Install cmake (matrix includes a Windows leg, so this job stays on the host
+# runner; apt is made resilient instead of moving into the Linux CI image)
+    - name: Install cmake
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/apt-retry
+      with:
+        packages: cmake
+
+#pull and build wolfssl
+    # Every matrix entry builds the identical wolfSSL (only the wolfTPM options
+    # vary), so cache the install prefix keyed on the resolved wolfSSL commit +
+    # OS. Tests are ctest against wolfTPM, so the wolfSSL source tree is not
+    # needed once installed -- caching install/ alone is sufficient.
+    - name: Resolve wolfSSL commit
+      id: wolfssl_rev
+      shell: bash
+      run: echo "sha=$(git ls-remote https://github.com/wolfSSL/wolfssl.git master | awk 'NR==1{print $1}')" >> "$GITHUB_OUTPUT"
+
+    - name: Cache wolfSSL install
+      id: wolfssl_cache
+      uses: actions/cache@v4
+      with:
+        path: install
+        key: wolfssl-cmake-${{ runner.os }}-${{ steps.wolfssl_rev.outputs.sha }}-v1
+
+    - name: Checkout wolfssl
+      if: steps.wolfssl_cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@master
+      with:
+        repository: wolfssl/wolfssl
+        ref: ${{ steps.wolfssl_rev.outputs.sha }}
+        path: wolfssl
+    - name: Build wolfssl
+      if: steps.wolfssl_cache.outputs.cache-hit != 'true'
+      working-directory: ./wolfssl
+      shell: bash
+      run: |
+        mkdir build
+        cd build
+        # wolfSSL PR 7188 broke "make install" unless WOLFSSL_INSTALL is set
+        cmake -DWOLFSSL_TPM=yes -DWOLFSSL_INSTALL=yes \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            -DCMAKE_C_FLAGS="-DWC_RSA_NO_PADDING -DWOLFSSL_PUBLIC_MP" ..
+        cmake --build . --config Release --parallel
+        cmake --install . --config Release
+
+#build wolftpm
+    - name: Build wolfTPM (${{ matrix.config.name }})
+      shell: bash
+      run: |
+        mkdir build
+        cd build
+        cmake ${{ matrix.config.options }} \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+            -DWITH_WOLFSSL="$GITHUB_WORKSPACE/install" ..
+        cmake --build . --config Release --parallel
+        cmake --install . --config Release
+
+    - name: Test fwTPM
+      if: contains(matrix.config.options, 'WOLFTPM_FWTPM')
+      shell: bash
+      run: |
+        cd build
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          # Windows: DLL search uses PATH, and wolfssl.dll installs to install/bin
+          PATH="$GITHUB_WORKSPACE/install/bin:$PATH" \
+            ctest -C Release --output-on-failure
+        else
+          LD_LIBRARY_PATH="$GITHUB_WORKSPACE/install/lib" \
+            ctest -C Release --output-on-failure
+        fi
+
+  # Verify that a static-library build can be installed and its exported
+  # CMake targets are self-consistent. The TIS build also verifies that an
+  # installed package resolves imported static-link dependencies before its
+  # exported target is loaded by a downstream project.
+  cmake-static-export:
+    name: CMake static export check
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    # cmake baked into the CI image — no apt mirror on the happy path.
+    container:
+      image: ghcr.io/wolfssl/wolftpm-ci:v1.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@master
+
+      # Same wolfSSL config as the matrix build above, so it shares that cache
+      # entry (key includes only OS + commit, not the wolfTPM options).
+      - name: Resolve wolfSSL commit
+        id: wolfssl_rev
+        shell: bash
+        run: echo "sha=$(git ls-remote https://github.com/wolfSSL/wolfssl.git master | awk 'NR==1{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache wolfSSL install
+        id: wolfssl_cache
+        uses: actions/cache@v4
+        with:
+          path: install
+          key: wolfssl-cmake-${{ runner.os }}-${{ steps.wolfssl_rev.outputs.sha }}-v1
+
+      - name: Checkout wolfssl
+        if: steps.wolfssl_cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@master
+        with:
+          repository: wolfssl/wolfssl
+          ref: ${{ steps.wolfssl_rev.outputs.sha }}
+          path: wolfssl
+
+      - name: Build and install wolfssl
+        if: steps.wolfssl_cache.outputs.cache-hit != 'true'
+        working-directory: ./wolfssl
+        run: |
+          mkdir build && cd build
+          cmake -DWOLFSSL_TPM=yes -DWOLFSSL_INSTALL=yes \
+              -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+              -DCMAKE_C_FLAGS="-DWC_RSA_NO_PADDING -DWOLFSSL_PUBLIC_MP" ..
+          cmake --build . --parallel
+          cmake --install .
+
+      - name: Build and install wolftpm (static, cmake-config wolfssl)
+        run: |
+          mkdir build && cd build
+          cmake \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DWOLFTPM_EXAMPLES=no \
+              -DWOLFTPM_FWTPM=yes \
+              -DWOLFTPM_INTERFACE=SPI \
+              -DWOLFTPM_BUILD_OUT_OF_TREE=yes \
+              -DCMAKE_C_FLAGS="-DWOLFSSL_AES_CFB -DWOLFSSL_PUBLIC_MP" \
+              -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/install" \
+              -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/install" \
+              ..
+          cmake --build . --parallel
+          cmake --install .
+
+      - name: Configure installed static consumer
+        run: |
+          cmake \
+              -S tests/cmake_static_consumer \
+              -B build-static-consumer \
+              -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/install"

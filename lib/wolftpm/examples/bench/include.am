@@ -1,0 +1,16 @@
+# vim:ft=automake
+# All paths should be given relative to the root
+
+if BUILD_EXAMPLES
+noinst_PROGRAMS += examples/bench/bench
+noinst_HEADERS  += examples/bench/bench.h
+examples_bench_bench_SOURCES      = examples/bench/bench.c \
+                                    examples/tpm_test_keys.c
+examples_bench_bench_LDADD        = src/libwolftpm.la $(LIB_STATIC_ADD)
+examples_bench_bench_DEPENDENCIES = src/libwolftpm.la
+endif
+
+example_benchdir = $(exampledir)/bench
+dist_example_bench_DATA = examples/bench/bench.c
+
+DISTCLEANFILES+= examples/bench/.libs/bench

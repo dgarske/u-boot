@@ -1,0 +1,146 @@
+# wolfTPM Hardware Interface Abstraction Layer (HAL) IO
+
+A single HAL callback must be registered to handle communication to the hardware.
+
+We distribute examples for several platforms to help with initial setup.
+
+If using one of the builtin system provided hardware interfaces then `NULL` can be supplied for the HAL IO callback.
+
+The available system TPM interfaces are:
+* Linux `/dev/tpm0`: Enabled with `WOLFTPM_LINUX_DEV` or `--enable-devtpm`.
+* Windows TBS: Enabled with `WOLFTPM_WINAPI` or `--enable-winapi`.
+* Software TPM Simulator: Enabled with `WOLFTPM_SWTPM` or `--enable-swtpm`.
+
+If using a HAL IO callback it is registered on library initialization using:
+* TPM2 Native API's: `TPM2_Init`
+* wolfTPM Wrappers: `wolfTPM2_Init`
+
+## Example HAL Implementations
+
+| Platform | Example File | Build Option |
+| -------- | ------------ | ------------ |
+| Atmel ASF | `tpm_io_atmel.c` | `WOLFSSL_ATMEL` |
+| Barebox | `tpm_io_barebox.c` | `__BAREBOX__` |
+| Infineon | `tpm_io_infineon.c` | `WOLFTPM_INFINEON_TRICORE` |
+| Linux | `tpm_io_linux.c` | `__linux__` |
+| Microchip | `tpm_io_microchip.c` | `WOLFTPM_MICROCHIP_HARMONY` |
+| QNX | `tpm_io_qnx.c` | `__QNX__` |
+| ST Cube HAL | `tpm_io_st.c` | `WOLFSSL_STM32_CUBEMX` |
+| wolfHAL | `tpm_io_wolfhal.c` | `WOLFTPM_WOLFHAL` |
+| Xilinx | `tpm_io_xilinx.c` | `__XILINX__` |
+
+## wolfHAL
+
+Enabled with `WOLFTPM_WOLFHAL` or `--enable-wolfhal`. Requires the wolfHAL
+headers on the include path.
+
+This HAL is placed last in the platform selection chain, so it is only used
+when no other platform macro is defined. Building for an STM32 target with the
+CubeMX headers present, for example, selects `tpm_io_st.c` instead.
+
+### Board definitions
+
+wolfTPM does not ship board definitions. `tpm_io_wolfhal.c` includes
+`"board.h"`, which the application provides on its include path. A wolfHAL
+project already has one, so in most cases only the TPM specific entries below
+need adding to it.
+
+For SPI:
+
+| Macro | Type | Description |
+| ----- | ---- | ----------- |
+| `BOARD_SPI_DEV` | `whal_Spi*` | SPI instance the TPM is connected to |
+| `BOARD_SPI_COM_CFG` | `whal_Spi_ComCfg*` | SPI session parameters |
+| `BOARD_GPIO_DEV` | `whal_Gpio*` | GPIO instance driving chip select |
+| `BOARD_CS_PIN` | pin number | Chip select pin, driven active low |
+
+For I2C (also requires `WOLFTPM_ADV_IO`, which `--enable-i2c` sets):
+
+| Macro | Type | Description |
+| ----- | ---- | ----------- |
+| `BOARD_I2C_DEV` | `whal_I2c*` | I2C instance the TPM is connected to |
+| `BOARD_I2C_COM_CFG` | `whal_I2c_ComCfg*` | I2C session parameters, including the TPM target address |
+
+The TPM target address goes in the `addr` field of `BOARD_I2C_COM_CFG`. Most
+TPM 2.0 I2C parts use `0x2e`. The `TPM2_I2C_ADDR` macro that the other I2C HALs
+use has no effect here, so defining it is a compile time error.
+
+A TPM 2.0 I2C part takes roughly 80us to wake and NAKs until it is ready, so
+each transfer is retried up to `TPM_I2C_TRIES` times (default 10). Define
+`TPM_I2C_TRIES` to override.
+
+A missing entry is reported at compile time, naming the macro required. Only
+the macros needed by the selected bus are checked.
+
+Example additions to an existing wolfHAL `board.h`:
+
+```c
+/* TPM on SPI1, chip select on PA15 */
+extern whal_Spi_ComCfg g_tpmSpiComCfg;
+#define BOARD_SPI_COM_CFG  (&g_tpmSpiComCfg)
+#define BOARD_CS_PIN       15
+```
+
+For I2C, where the session config carries the TPM address:
+
+```c
+/* board.c */
+whal_I2c_ComCfg g_tpmI2cComCfg = {
+    .freq   = 400000, /* Hz */
+    .addr   = 0x2e,   /* TPM target address */
+    .addrSz = 7,      /* bits */
+};
+
+/* board.h */
+extern whal_I2c_ComCfg g_tpmI2cComCfg;
+#define BOARD_I2C_COM_CFG  (&g_tpmI2cComCfg)
+```
+
+## HAL IO Callback Function
+
+Here are the prototypes for the HAL callback function:
+
+```c
+#ifdef WOLFTPM_ADV_IO
+typedef int (*TPM2HalIoCb)(struct TPM2_CTX*, INT32 isRead, UINT32 addr,
+    BYTE* xferBuf, UINT16 xferSz, void* userCtx);
+#else
+typedef int (*TPM2HalIoCb)(struct TPM2_CTX*, const BYTE* txBuf, BYTE* rxBuf,
+    UINT16 xferSz, void* userCtx);
+#endif
+```
+
+Here are example function definitions:
+
+```c
+#ifdef WOLFTPM_ADV_IO
+int TPM2_IoCb(TPM2_CTX*, int isRead, word32 addr, byte* buf, word16 size,
+    void* userCtx);
+#else
+int TPM2_IoCb(TPM2_CTX* ctx, const byte* txBuf, byte* rxBuf,
+    word16 xferSz, void* userCtx);
+#endif
+```
+
+## Additional Build options
+
+* `WOLFTPM_CHECK_WAIT_STATE`: Enables check of the wait state during a SPI transaction. Most TPM 2.0 chips require this and typically only require 0-2 wait cycles depending on the command. Only the Infineon TPM's guarantee no wait states.
+* `WOLFTPM_ADV_IO`: Enables advanced IO callback mode that includes TIS register and read/write flag. This is requires for I2C, but can be used with SPI also.
+* `WOLFTPM_DEBUG_IO`: Enable logging of the IO (if using the example HAL).
+* `WOLFTPM_HAL_RESET`: Optional TPM hardware reset (nRST) control in the example HAL (`--enable-hal-reset`). On Linux, `TPM2_IoCb_Reset(&dev->ctx, userCtx)` pulses nRST (active low) via the GPIO char device (raw GPIO v2 uAPI, no libgpiod).
+
+## TPM reset (nRST) HAL macros (when `WOLFTPM_HAL_RESET` is set)
+
+* `WOLFTPM_RESET_GPIOCHIP`: GPIO char device. Default: `/dev/gpiochip0`
+* `WOLFTPM_RESET_LINE`: GPIO line wired to nRST. Default: ST33 = `24` (GPIO24, Pi pin 18), Nuvoton = `4` (GPIO4). Also settable via `--enable-hal-reset=<line>`.
+* `WOLFTPM_RESET_HOLD_US` / `WOLFTPM_RESET_SETTLE_US`: reset hold / post-reset settle time (us). Defaults: `300000` / `1000000`.
+
+## Additional Compiler macros
+
+* `TPM2_SPI_DEV_PATH`: Set to the device string to be opened by the Linux IOCb.  Default: "/dev/spidev0."
+* `TPM2_SPI_DEV_CS`: Set to the number string of the CS to use. Default: "0"
+
+These can be set during configure as:
+./configure CPPFLAGS="-DTPM2_SPI_DEV_PATH=\"/dev/spidev0.\" -DTPM2_SPI_DEV_CS=\"0\" " 
+
+Note that autodetect will use TPM2_SPI_DEV_PATH[0..4] for the searched device paths.

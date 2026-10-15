@@ -1,0 +1,153 @@
+/* tpm_io_mmio.c
+ *
+ * Copyright (C) 2006-2026 wolfSSL Inc.
+ *
+ * This file is part of wolfTPM.
+ *
+ * wolfTPM is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * wolfTPM is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
+/* Support for Memory Mapped I/O for accessing TPM */
+
+#ifdef HAVE_CONFIG_H
+    #include <config.h>
+#endif
+
+#include <wolftpm/tpm2.h>
+#include <wolftpm/tpm2_tis.h>
+#include "tpm_io.h"
+
+/******************************************************************************/
+/* --- BEGIN IO Callback Logic -- */
+/******************************************************************************/
+
+/* Included via tpm_io.c if WOLFTPM_INCLUDE_IO_FILE is defined */
+#ifdef WOLFTPM_INCLUDE_IO_FILE
+#ifdef WOLFTPM_MMIO
+
+#ifndef MMIO_BASE_ADDRESS
+#define MMIO_BASE_ADDRESS 0xFE000000u
+#endif
+
+#ifndef WOLFTPM_ADV_IO
+#error "WOLFTPM_MMIO requires WOLFTPM_ADV_IO"
+#endif
+
+#ifdef __GNUC__
+    /* this will prevent the compiler to re-order memory accesses across
+    * sw_barrier() invocation.
+    */
+    #define sw_barrier() __asm__ __volatile__ ("":::"memory")
+#else
+    #define sw_barrier()
+#endif /* __GNUC__ */
+
+static void TPM2_Mmio_Read32(word32 addr, byte *buf)
+{
+    volatile word32 *_addr = (volatile word32*)(wordptr)addr;
+    word32 v;
+
+    v = *_addr;
+    sw_barrier();
+    memcpy(buf, (byte*)&v, sizeof(word32));
+}
+
+static void TPM2_Mmio_Write32(word32 addr, byte *buf)
+{
+    volatile word32 *_addr = (volatile word32*)(wordptr)addr;
+    word32 v;
+
+    memcpy((uint8_t*)&v, buf, sizeof(word32));
+    *_addr = v;
+    sw_barrier();
+}
+
+static void TPM2_Mmio_Read8(word32 addr, byte *buf)
+{
+    volatile byte *_addr = (volatile byte*)(wordptr)addr;
+
+    *buf = *_addr;
+    sw_barrier();
+}
+
+static void TPM2_Mmio_Write8(word32 addr, byte *buf)
+{
+    volatile byte *_addr = (volatile byte*)(wordptr)addr;
+
+    *_addr = *buf;
+    sw_barrier();
+}
+
+/* Maximum valid TPM register offset to prevent address wrap-around */
+#ifndef TPM_MMIO_MAX_OFFSET
+#define TPM_MMIO_MAX_OFFSET 0x1000000u /* 16MB - well above any valid TPM offset */
+#endif
+
+int TPM2_IoCb_Mmio(TPM2_CTX *ctx, int isRead, word32 addr, byte* buf, word16 size,
+    void* userCtx)
+{
+    size_t i;
+    word32 effectiveAddr;
+    word32 regOffset;
+    int isFifo;
+
+    /* Bounds check to prevent address wrap-around */
+    if (addr >= TPM_MMIO_MAX_OFFSET) {
+        return TPM_RC_FAILURE;
+    }
+
+    effectiveAddr = MMIO_BASE_ADDRESS + addr;
+
+    /* FIFO registers use the same address for every access
+     * (hardware auto-increments internally).
+     * Non-FIFO registers need the address advanced for multi-byte access. */
+    regOffset = addr & 0x0FFFu;
+    isFifo = (regOffset == TPM_TIS_DATA_FIFO_OFFSET ||
+              regOffset == TPM_TIS_XDATA_FIFO_OFFSET);
+
+    /* IO for 32-bit aligned */
+    for (i = 0; ((size_t)size - i) >= sizeof(word32); i += sizeof(word32)) {
+        if (isRead)
+            TPM2_Mmio_Read32(effectiveAddr, buf + i);
+        else
+            TPM2_Mmio_Write32(effectiveAddr, buf + i);
+        if (!isFifo)
+            effectiveAddr += sizeof(word32);
+    }
+
+    /* IO for unaligned remainder */
+    for (; i < (size_t)size; i++) {
+        if (isRead)
+            TPM2_Mmio_Read8(effectiveAddr, buf + i);
+        else
+            TPM2_Mmio_Write8(effectiveAddr, buf + i);
+        if (!isFifo)
+            effectiveAddr++;
+    }
+
+    (void)ctx;
+    (void)userCtx;
+
+    return 0;
+}
+
+#undef sw_barrier
+
+#endif /* WOLFTPM_MMIO */
+#endif /* WOLFTPM_INCLUDE_IO_FILE */
+
+/******************************************************************************/
+/* --- END IO Callback Logic -- */
+/******************************************************************************/

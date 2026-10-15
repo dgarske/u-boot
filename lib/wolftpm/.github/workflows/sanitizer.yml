@@ -1,0 +1,159 @@
+name: Sanitizer Tests
+
+on:
+  push:
+    branches: [ 'master', 'main', 'release/**' ]
+  pull_request:
+    branches: [ '*' ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  repository_dispatch:
+    types: [nightly-trigger]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Auto-resolve the latest wolfSSL -stable tag so the base sanitizers also run
+  # against the shipped release, not just master. The v185/PQC rows stay on
+  # master because their ML-DSA/ML-KEM API lands post-v5.9.1-stable.
+  discover:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    uses: ./.github/workflows/_resolve-wolfssl.yml
+
+  sanitizer_test:
+    name: ${{ matrix.name }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: discover
+    runs-on: ubuntu-latest
+    # Host runner: tpm2-tools make-check (activatecredential) hits a tpm2-tools
+    # OpenSSL credential-integrity quirk inside a container, so stay on the host
+    # (where it passes) and just make apt resilient to mirror timeouts.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "ASan"
+            cflags: "-fsanitize=address -fno-omit-frame-pointer -g -O1"
+            ldflags: "-fsanitize=address"
+            asan_options: "detect_leaks=0"
+          - name: "UBSan"
+            cflags: "-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+            ldflags: "-fsanitize=undefined"
+            ubsan_options: "halt_on_error=1:print_stacktrace=1"
+          - name: "LeakSan"
+            cflags: "-fsanitize=leak -fno-omit-frame-pointer -g"
+            ldflags: "-fsanitize=leak"
+
+          # Same base sanitizers, but linked against the latest wolfSSL -stable
+          # release instead of master.
+          - name: "ASan (latest-stable)"
+            wolfssl_ref: ${{ needs.discover.outputs.latest_stable }}
+            cflags: "-fsanitize=address -fno-omit-frame-pointer -g -O1"
+            ldflags: "-fsanitize=address"
+            asan_options: "detect_leaks=0"
+          - name: "UBSan (latest-stable)"
+            wolfssl_ref: ${{ needs.discover.outputs.latest_stable }}
+            cflags: "-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+            ldflags: "-fsanitize=undefined"
+            ubsan_options: "halt_on_error=1:print_stacktrace=1"
+          - name: "LeakSan (latest-stable)"
+            wolfssl_ref: ${{ needs.discover.outputs.latest_stable }}
+            cflags: "-fsanitize=leak -fno-omit-frame-pointer -g"
+            ldflags: "-fsanitize=leak"
+
+          # v1.85 PQC sanitizer coverage — three entries because each catches
+          # a different bug class. SWTPM transport is the Linux configure
+          # default (configure.ac:287); explicit flag omitted everywhere.
+          # ASan: heap-buffer-overflow / use-after-scope on the new sequence-
+          # handle objects + PQC marshaling paths.
+          - name: "ASan-v185"
+            cflags: "-fsanitize=address -O1 -fno-omit-frame-pointer -g"
+            ldflags: "-fsanitize=address"
+            asan_options: "detect_leaks=0"
+            wolftpm_extra_config: "--enable-v185"
+            wolfssl_extra_config: "--enable-dilithium --enable-mlkem --enable-experimental --enable-harden"
+
+          # UBSan-v185: enables undefined-behavior checks but disables
+          # `alignment` (wolfSSL dilithium internal sword32 reads from
+          # byte buffers) and the integer overflow/shift checks (wolfSSL
+          # Hash_df 440<<24) — both pre-existing wolfSSL UB.
+          - name: "UBSan-v185"
+            cc: clang
+            cflags: "-fsanitize=undefined -fno-sanitize=alignment,signed-integer-overflow,shift -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+            ldflags: "-fsanitize=undefined"
+            ubsan_options: "halt_on_error=1:print_stacktrace=1"
+            wolftpm_extra_config: "--enable-v185"
+            wolfssl_extra_config: "--enable-dilithium --enable-mlkem --enable-experimental --enable-harden"
+
+          # MSan-v185: Pure ML-DSA one-shot signing and streaming Hash-ML-DSA
+          # both allocate sequence-handle state incrementally — partial-init
+          # reads on those buffers are MSan territory, not ASan.
+          - name: "MSan-v185"
+            cc: clang
+            cflags: "-fsanitize=memory -fsanitize-memory-track-origins=2 -fno-omit-frame-pointer -O1 -g"
+            ldflags: "-fsanitize=memory"
+            wolftpm_extra_config: "--enable-v185"
+            wolfssl_extra_config: "--enable-dilithium --enable-mlkem --enable-experimental --enable-harden"
+
+    steps:
+      - name: Workaround high-entropy ASLR
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      - name: Install tpm2-tools
+        uses: ./.github/actions/apt-retry
+        with:
+          packages: tpm2-tools libtss2-tcti-mssim0
+
+      - name: Setup wolfSSL with ${{ matrix.name }}
+        uses: ./.github/actions/setup-wolfssl
+        with:
+          ref: ${{ matrix.wolfssl_ref || 'master' }}
+          cc: ${{ matrix.cc || 'gcc' }}
+          configure-flags: --enable-wolftpm --enable-pkcallbacks --enable-keygen ${{ matrix.wolfssl_extra_config }}
+          cflags: -DWC_RSA_NO_PADDING ${{ matrix.cflags }}
+          ldflags: ${{ matrix.ldflags }}
+          prefix: /tmp/wolfssl-install
+
+      - name: Build wolfTPM with fwTPM + ${{ matrix.name }}
+        run: |
+          ./autogen.sh
+          CC=${{ matrix.cc || 'gcc' }} ./configure --enable-fwtpm --enable-swtpm --enable-debug \
+              ${{ matrix.wolftpm_extra_config }} \
+              --with-wolfcrypt=/tmp/wolfssl-install \
+              CFLAGS="${{ matrix.cflags }}" \
+              LDFLAGS="${{ matrix.ldflags }}"
+          make -j"$(nproc)"
+
+      - name: Run tests (make check)
+        env:
+          # WOLFSSL_PATH must point at the wolfSSL *source tree* (with built
+          # examples/server/server), not the install prefix — run_examples.sh
+          # `pushd $WOLFSSL_PATH && ./examples/server/server ...` for TLS tests.
+          WOLFSSL_PATH: ${{ github.workspace }}/wolfssl
+          LD_LIBRARY_PATH: /tmp/wolfssl-install/lib
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+          UBSAN_OPTIONS: ${{ matrix.ubsan_options }}
+        run: |
+          FWTPM_USE_FIXED_PORT=1 \
+          sudo -E unshare --net /bin/bash -c '
+            set -e
+            ip link set lo up
+            make check
+          '
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wolftpm-${{ matrix.name }}-logs
+          path: |
+            /tmp/fwtpm_check_*.log
+            test-suite.log
+            tests/*.log
+            config.log
+          retention-days: 5

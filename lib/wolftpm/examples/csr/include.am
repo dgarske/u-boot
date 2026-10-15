@@ -1,0 +1,16 @@
+# vim:ft=automake
+# All paths should be given relative to the root
+
+if BUILD_EXAMPLES
+noinst_PROGRAMS += examples/csr/csr
+noinst_HEADERS  += examples/csr/csr.h
+examples_csr_csr_SOURCES      = examples/csr/csr.c \
+                                examples/tpm_test_keys.c
+examples_csr_csr_LDADD        = src/libwolftpm.la $(LIB_STATIC_ADD)
+examples_csr_csr_DEPENDENCIES = src/libwolftpm.la
+endif
+
+example_csrdir = $(exampledir)/csr
+dist_example_csr_DATA = examples/csr/csr.c
+
+DISTCLEANFILES+= examples/csr/.libs/csr

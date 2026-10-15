@@ -1,0 +1,690 @@
+name: fwTPM Tests
+
+on:
+  push:
+    branches: [ 'master', 'main', 'release/**' ]
+  pull_request:
+    branches: [ '*' ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  repository_dispatch:
+    types: [nightly-trigger]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------
+  # make check — unit tests + examples against fwtpm_server
+  # ----------------------------------------------------------------
+  fwtpm-examples:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # fwTPM with socket/swtpm transport
+          - name: fwtpm-socket
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm --enable-debug
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: false
+
+          # fwTPM with TIS/shared-memory transport
+          - name: fwtpm-tis
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --disable-swtpm --enable-debug
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: false
+
+          # v1.85 PQC: full make check + pqc_mssim_e2e.sh + tpm2-tools
+          # Highest-leverage entry — exercises wrapper unit tests
+          # (tests/unit_tests.c v1.85 cases) + handler unit tests
+          # (tests/fwtpm_unit_tests.c v1.85 cases) + the new mssim E2E
+          # harness against fwtpm_server in one shot. --enable-swtpm omitted
+          # because configure.ac:287 enables it by default on Linux.
+          - name: fwtpm-v185
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-v185
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --enable-dilithium --enable-mlkem --enable-experimental --enable-harden
+            build_only: false
+
+          # v1.85 PQC: build-only safety net with DEBUG_WOLFTPM so any
+          # printf-format-string drift in v1.85-guarded debug paths breaks
+          # the build instead of silently corrupting log output. No
+          # --enable-swtpm because build-only never invokes the socket client.
+          - name: fwtpm-v185-build-only
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-v185
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --enable-dilithium --enable-mlkem --enable-experimental --enable-harden
+            build_only: true
+            extra_cflags: -DDEBUG_WOLFTPM
+
+          # Build-only: fwTPM with RSA disabled
+          - name: fwtpm-no-rsa
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-rsa
+            build_only: true
+
+          # Build-only: fwTPM with ECC disabled
+          - name: fwtpm-no-ecc
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-ecc
+            build_only: true
+
+          # Build-only: fwTPM with SHA-384 disabled
+          - name: fwtpm-no-sha384
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-sha384
+            build_only: true
+
+          # Build-only: fwTPM with SHA-1 disabled (verifies !NO_SHA gating
+          # for SHA-1 PCR bank and RSA hash conversion)
+          - name: fwtpm-no-sha1
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-sha
+            build_only: true
+            extra_cflags: -DNO_SHA
+
+          # Build-only: fwTPM server only (no client library)
+          - name: fwtpm-only
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm-only --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+
+          # Build-only: fwTPM with attestation and NV disabled
+          - name: fwtpm-minimal
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_ATTESTATION -DFWTPM_NO_NV -DFWTPM_NO_POLICY -DFWTPM_NO_CREDENTIAL -DFWTPM_NO_DA -DFWTPM_NO_PARAM_ENC
+
+          # Build-only: individual FWTPM_NO_* macro tests
+          - name: fwtpm-no-policy
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_POLICY
+
+          - name: fwtpm-no-nv
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_NV
+
+          - name: fwtpm-no-attestation
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_ATTESTATION
+
+          - name: fwtpm-no-credential
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_CREDENTIAL
+
+          - name: fwtpm-no-da
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_DA
+
+          - name: fwtpm-no-param-enc
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_PARAM_ENC
+
+          # Build-only: finer per-command-group FWTPM_NO_* macros
+          - name: fwtpm-no-key-migration
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_KEY_MIGRATION
+
+          - name: fwtpm-no-ecdh
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_ECDH
+
+          - name: fwtpm-no-hash-cmds
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_HASH_CMDS
+
+          - name: fwtpm-no-context
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_CONTEXT
+
+          - name: fwtpm-no-sym-encrypt
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_SYM_ENCRYPT
+
+          - name: fwtpm-no-clock
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_CLOCK
+
+          - name: fwtpm-no-pp
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DFWTPM_NO_PP
+
+          # Build-only: fewer PCRs than the 24 standard ones. The locality
+          # tables are sized to a fixed 24 while IMPLEMENTATION_PCR sets the
+          # implemented count, so this leg proves the two boundaries compile
+          # apart. PLATFORM_PCR must drop with it or PCR_SELECT_MIN exceeds
+          # PCR_SELECT_MAX. Runtime coverage is in fwtpm-gated-runtime.
+          - name: fwtpm-reduced-pcr
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DIMPLEMENTATION_PCR=8 -DPLATFORM_PCR=8
+
+          # Note: the all-gates combinations are built AND run by the
+          # fwtpm-gated-runtime job below, so they are not duplicated here.
+
+          # Build-only: cross-algorithm + feature macro combinations
+          - name: fwtpm-no-rsa-no-policy
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-rsa
+            build_only: true
+            extra_cflags: -DFWTPM_NO_POLICY
+
+          - name: fwtpm-no-ecc-no-nv
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-ecc
+            build_only: true
+            extra_cflags: -DFWTPM_NO_NV
+
+          # Build-only: WOLFTPM_SMALL_STACK (heap-allocated crypto objects)
+          - name: fwtpm-small-stack
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            extra_cflags: -DWOLFTPM_SMALL_STACK
+
+          # Build-only: pedantic warnings with -Werror (GCC)
+          - name: fwtpm-pedantic-gcc
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            make_cflags: "-Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2"
+
+          # Build-only: pedantic warnings with -Werror (clang)
+          - name: fwtpm-pedantic-clang
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            cc: clang
+            make_cflags: "-Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2"
+
+          # Build-only: pedantic warnings on the POSIX TIS transport and its
+          # dedicated HAL/semaphore tests.
+          - name: fwtpm-pedantic-tis
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm --disable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            make_cflags: "-Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2"
+
+          # Build-only: pedantic fwTPM-only (no client library)
+          - name: fwtpm-pedantic-only
+            os: ubuntu-latest
+            wolftpm_config: --enable-fwtpm-only
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: true
+            make_cflags: "-Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wformat=2"
+
+          # Note: ASan / UBSan / LeakSan coverage moved to sanitizer.yml
+
+          # macOS: fwTPM with socket transport
+          - name: fwtpm-macos-socket
+            wolftpm_config: --enable-fwtpm --enable-swtpm --enable-debug
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            build_only: false
+            os: macos-latest
+
+    steps:
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      # Matrix includes a macOS leg, so this job stays on the host runner;
+      # apt is made resilient rather than moving into the Linux CI image.
+      - name: Install tpm2-tools
+        if: ${{ !matrix.build_only && runner.os != 'macOS' }}
+        uses: ./.github/actions/apt-retry
+        with:
+          packages: tpm2-tools libtss2-tcti-mssim0
+
+      - name: macOS build deps (skip tpm2-tools)
+        if: ${{ !matrix.build_only && runner.os == 'macOS' }}
+        run: |
+          # wolfSSL's autogen.sh needs autoreconf (autoconf+automake+libtool),
+          # which aren't on the macos-latest runner image by default.
+          # tpm2-tss / tpm2-tools are no longer in homebrew-core and their
+          # source build hits multiple Linux-isms (prctl.h, mremap, endian.h,
+          # uchar.h, -Wl,-z,relro). fwtpm_check.sh treats tpm2-tools as
+          # optional and will SKIP the tpm2_tools_test.sh stage when absent.
+          brew install autoconf automake libtool pkg-config
+          echo "tpm2-tools install skipped on macOS; fwtpm_check.sh handles absence"
+
+      - name: Setup wolfSSL
+        uses: ./.github/actions/setup-wolfssl
+        with:
+          cc: ${{ matrix.cc || 'gcc' }}
+          configure-flags: ${{ matrix.wolfssl_config }}
+          cflags: -DWC_RSA_NO_PADDING ${{ matrix.extra_cflags }}
+          ldflags: ${{ matrix.extra_ldflags }}
+
+      - name: Build wolfTPM
+        run: |
+          ./autogen.sh
+          EXTRA_CFLAGS="${{ matrix.extra_cflags }}"
+          EXTRA_LDFLAGS="${{ matrix.extra_ldflags }}"
+          CONFIGURE_ARGS="${{ matrix.wolftpm_config }}"
+          if [ -n "$EXTRA_CFLAGS" ]; then
+            CONFIGURE_ARGS="$CONFIGURE_ARGS CFLAGS=\"$EXTRA_CFLAGS\""
+          fi
+          if [ -n "$EXTRA_LDFLAGS" ]; then
+            CONFIGURE_ARGS="$CONFIGURE_ARGS LDFLAGS=\"$EXTRA_LDFLAGS\""
+          fi
+          CC=${{ matrix.cc || 'gcc' }} eval ./configure $CONFIGURE_ARGS
+          # nproc is Linux-only; the fwtpm-macos-socket entry needs the fallback.
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
+          MAKE_CFLAGS="${{ matrix.make_cflags }}"
+          if [ -n "$MAKE_CFLAGS" ]; then
+            make -j"$JOBS" CFLAGS="$MAKE_CFLAGS"
+          else
+            make -j"$JOBS"
+          fi
+
+      - name: Run tests (make check)
+        if: ${{ !matrix.build_only }}
+        env:
+          WOLFSSL_PATH: ./wolfssl
+        run: |
+          if command -v unshare >/dev/null 2>&1; then
+            FWTPM_USE_FIXED_PORT=1 \
+            sudo -E unshare --net /bin/bash -c '
+              set -e
+              ip link set lo up
+              make check
+            '
+          else
+            make check
+          fi
+
+      - name: Print test-suite.log on failure
+        if: ${{ failure() && !matrix.build_only }}
+        run: |
+          if [ -f test-suite.log ]; then
+            echo "=== test-suite.log ==="
+            cat test-suite.log
+          fi
+          for f in tests/*.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            cat "$f"
+          done
+
+      - name: Upload failure logs
+        if: ${{ failure() && !matrix.build_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fwtpm-logs-${{ matrix.name }}
+          path: |
+            /tmp/fwtpm_check_*.log
+            test-suite.log
+            tests/*.log
+          retention-days: 5
+
+  # ----------------------------------------------------------------
+  # Command-group gates: runtime behavior, not just compilation.
+  #
+  # `make check` cannot be used here - it also runs fwtpm_check.sh, which
+  # drives the examples and tpm2-tools against a server that no longer
+  # implements the gated commands. This job builds each gated configuration
+  # and runs only tests/fwtpm_unit.test, whose test_fwtpm_command_gates /
+  # test_fwtpm_total_commands cases assert that a gated command is rejected
+  # with TPM_RC_COMMAND_CODE, is absent from TPM_CAP_COMMANDS, and is not
+  # counted in TPM_PT_TOTAL_COMMANDS.
+  # ----------------------------------------------------------------
+  fwtpm-gated-runtime:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every command-group gate together on an ECC-only build - the
+          # minimal configuration documented in docs/FWTPM.md.
+          - name: all-gates-ecc-only
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --disable-rsa
+            extra_cflags: >-
+              -DFWTPM_NO_POLICY
+              -DFWTPM_NO_ATTESTATION
+              -DFWTPM_NO_CREDENTIAL
+              -DFWTPM_NO_DA
+              -DFWTPM_NO_PARAM_ENC
+              -DFWTPM_NO_KEY_MIGRATION
+              -DFWTPM_NO_ECDH
+              -DFWTPM_NO_HASH_CMDS
+              -DFWTPM_NO_CONTEXT
+              -DFWTPM_NO_SYM_ENCRYPT
+              -DFWTPM_NO_CLOCK
+              -DFWTPM_NO_PP
+
+          # Same gates with ML-DSA: SequenceUpdate must survive (the ML-DSA
+          # verify sequences stream through it) while SequenceComplete must
+          # not, and the ML-DSA sign/verify sequence tests must still pass.
+          - name: all-gates-mldsa
+            wolftpm_config: --enable-fwtpm --enable-swtpm --enable-v185 --enable-mldsa
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen --enable-experimental --enable-dilithium --enable-mlkem
+            extra_cflags: >-
+              -DFWTPM_NO_POLICY
+              -DFWTPM_NO_ATTESTATION
+              -DFWTPM_NO_CREDENTIAL
+              -DFWTPM_NO_DA
+              -DFWTPM_NO_PARAM_ENC
+              -DFWTPM_NO_KEY_MIGRATION
+              -DFWTPM_NO_ECDH
+              -DFWTPM_NO_HASH_CMDS
+              -DFWTPM_NO_CONTEXT
+              -DFWTPM_NO_SYM_ENCRYPT
+              -DFWTPM_NO_CLOCK
+              -DFWTPM_NO_PP
+
+          # Fewer PCRs than the 24 standard ones: exercises the highest
+          # implemented PCR and the first unavailable one
+          # (test_fwtpm_pcr_bounds).
+          - name: reduced-pcr
+            wolftpm_config: --enable-fwtpm --enable-swtpm
+            wolfssl_config: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+            extra_cflags: -DIMPLEMENTATION_PCR=8 -DPLATFORM_PCR=8
+
+    steps:
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      - name: Setup wolfSSL
+        uses: ./.github/actions/setup-wolfssl
+        with:
+          configure-flags: ${{ matrix.wolfssl_config }}
+          cflags: -DWC_RSA_NO_PADDING ${{ matrix.extra_cflags }}
+
+      - name: Build wolfTPM (${{ matrix.name }})
+        run: |
+          ./autogen.sh
+          ./configure ${{ matrix.wolftpm_config }} \
+            CFLAGS="${{ matrix.extra_cflags }}"
+          make -j"$(nproc)" tests/fwtpm_unit.test
+
+      - name: Run fwTPM handler tests
+        run: ./tests/fwtpm_unit.test
+
+  # ----------------------------------------------------------------
+  # Dictionary Attack TPM_RC_RETRY (daUsed) end-to-end.
+  # Builds the server with -DFWTPM_DA_USED_RETRY so it returns TPM_RC_RETRY on
+  # the first DA-protected auth use, then runs only da_check -lockout (which
+  # rides through RC_RETRY and exercises lockout/recovery). Kept separate from
+  # the examples matrix because the RETRY emulation breaks non-retry-aware
+  # clients sharing one server (e.g. unit.test).
+  # ----------------------------------------------------------------
+  fwtpm-da-retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      - name: Setup wolfSSL
+        uses: ./.github/actions/setup-wolfssl
+        with:
+          configure-flags: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+          cflags: -DWC_RSA_NO_PADDING
+
+      - name: Build wolfTPM (FWTPM_DA_USED_RETRY)
+        run: |
+          ./autogen.sh
+          ./configure --enable-fwtpm --enable-swtpm --enable-debug \
+            CFLAGS="-DFWTPM_DA_USED_RETRY"
+          make -j"$(nproc)"
+
+      - name: Run DA RC_RETRY end-to-end
+        run: |
+          ./tests/fwtpm_da_retry.sh || rc=$?
+          # 77 is the autotools "skip" code; treat it as a pass.
+          [ "${rc:-0}" -eq 0 ] || [ "${rc:-0}" -eq 77 ]
+
+  # ----------------------------------------------------------------
+  # tpm2-tools compatibility test against IBM SW TPM
+  # Validates that tpm2_tools_test.sh works on a reference TPM.
+  #
+  # NOTE: tpm2-tools compatibility against fwtpm_server is now exercised
+  # by the fwtpm-examples matrix entries (fwtpm-socket, fwtpm-asan,
+  # fwtpm-ubsan) via `make check` — the standalone fwtpm-tpm2tools job
+  # was removed to eliminate duplication.
+  # ----------------------------------------------------------------
+  ibmswtpm-tpm2tools:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    # Host runner: tpm2-tools activatecredential hits a tpm2-tools OpenSSL
+    # credential-integrity quirk inside a container, so stay on the host
+    # (where it passes) and just make apt resilient to mirror timeouts.
+    steps:
+      - uses: actions/checkout@master
+
+      - name: Install tpm2-tools
+        uses: ./.github/actions/apt-retry
+        with:
+          packages: tpm2-tools libtss2-tcti-mssim0
+
+      - name: Build IBM SW TPM
+        uses: ./.github/actions/setup-ibmswtpm
+        with:
+          # Increase transient object slots — tpm2-tools ESYS creates
+          # transient salt keys for HMAC sessions which consume extra slots
+          max-loaded-objects: 7
+
+      # Start the simulator and run the tests in one step: GitHub reaps a
+      # step's background processes between steps in container jobs, so a
+      # server started in a separate step would be gone by the test step.
+      - name: Run tpm2-tools tests
+        run: |
+          ibmswtpm2/src/tpm_server &
+          TPM_PID=$!
+          sleep 1
+          kill -0 "$TPM_PID"
+          scripts/tpm2_tools_test.sh --no-start
+          rc=$?
+          kill "$TPM_PID" 2>/dev/null || true
+          exit $rc
+
+  # ----------------------------------------------------------------
+  # fwTPM STM32 emulator test (m33mu Cortex-M33 simulator)
+  # ----------------------------------------------------------------
+  fwtpm-emulator:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    container: ghcr.io/wolfssl/m33mu-ci:1.9
+    steps:
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      - name: Checkout wolfSSL
+        uses: actions/checkout@v4
+        with:
+          repository: wolfssl/wolfssl
+          path: wolfssl
+
+      - name: Checkout wolftpm-examples
+        uses: actions/checkout@v4
+        with:
+          repository: wolfssl/wolftpm-examples
+          ref: fwtpm_stm32h5
+          path: wolftpm-examples
+
+      # Runs inside the m33mu CI container (already root, no sudo); just make
+      # apt resilient to mirror timeouts.
+      - name: Install build dependencies
+        uses: ./.github/actions/apt-retry
+        with:
+          packages: autoconf automake libtool
+          sudo: "false"
+
+      - name: Install STM32Cube H5 SDK
+        run: |
+          SDK=$HOME/STM32Cube/Repository/STM32Cube_FW_H5_V1.5.1
+          mkdir -p $SDK/Drivers
+          git clone --depth 1 --branch v1.5.0 \
+            https://github.com/STMicroelectronics/stm32h5xx_hal_driver.git \
+            $SDK/Drivers/STM32H5xx_HAL_Driver
+          git clone --depth 1 --branch v1.4.0 \
+            https://github.com/STMicroelectronics/cmsis_device_h5.git \
+            $SDK/Drivers/CMSIS/Device/ST/STM32H5xx
+          git clone --depth 1 --branch v5.9.0 \
+            https://github.com/STMicroelectronics/cmsis_core.git \
+            /tmp/cmsis_core
+          cp -a /tmp/cmsis_core/Include $SDK/Drivers/CMSIS/Include
+
+      - name: Build wolfSSL (for fwTPM STM32 port)
+        working-directory: ./wolfssl
+        run: |
+          ./autogen.sh
+          ./configure --enable-wolftpm --enable-pkcallbacks --enable-keygen \
+              CFLAGS="-DWC_RSA_NO_PADDING"
+          make -j"$(nproc)"
+          make install
+          ldconfig
+
+      - name: Copy wolfSSL to /tmp/wolfssl-fwtpm
+        run: cp -a wolfssl /tmp/wolfssl-fwtpm
+
+      - name: Run fwTPM emulator test (non-TZ)
+        env:
+          WOLFSSL_DIR: /tmp/wolfssl-fwtpm
+          WOLFTPM_EXAMPLES_DIR: ${{ github.workspace }}/wolftpm-examples
+        run: scripts/fwtpm_emu_test.sh
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fwtpm-emulator-logs
+          path: |
+            /tmp/fwtpm_emu_test.log
+            /tmp/fwtpm_emu_build.log
+          retention-days: 5
+
+  # ----------------------------------------------------------------
+  # Valgrind memory-safety check
+  # Runs the unit test under valgrind for three FWTPM_DECLARE_VAR
+  # configurations (default, SMALL_STACK, NO_HEAP) so the
+  # stack-vs-heap allocation paths are all exercised.
+  # ----------------------------------------------------------------
+  fwtpm-valgrind:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    # Deps baked into the CI image — no apt mirror on the happy path. The added
+    # caps let the fwtpm tests create a network namespace (unshare --net).
+    container:
+      image: ghcr.io/wolfssl/wolftpm-ci:v1.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --cap-add=SYS_ADMIN --cap-add=NET_ADMIN --cap-add=NET_RAW
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fwtpm-valgrind-default
+            extra_cflags: ""
+          - name: fwtpm-valgrind-smallstack
+            extra_cflags: "-DWOLFTPM_SMALL_STACK"
+          - name: fwtpm-valgrind-noheap
+            extra_cflags: "-DWOLFTPM2_NO_HEAP"
+
+    steps:
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      - name: Setup wolfSSL
+        uses: ./.github/actions/setup-wolfssl
+        with:
+          configure-flags: --enable-wolftpm --enable-pkcallbacks --enable-keygen
+          cflags: -DWC_RSA_NO_PADDING -g -O1
+
+      - name: Build wolfTPM (${{ matrix.name }})
+        run: |
+          ./autogen.sh
+          ./configure --enable-fwtpm --enable-swtpm --enable-debug \
+              CFLAGS="${{ matrix.extra_cflags }} -g -O1"
+          make -j"$(nproc)"
+
+      - name: Run unit.test under valgrind
+        run: |
+          sudo -E unshare --net /bin/bash -c '
+            ip link set lo up
+            rm -f fwtpm_nv.bin
+            ./src/fwtpm/fwtpm_server > /tmp/fwtpm_server.log 2>&1 &
+            SERVER_PID=$!
+            sleep 1
+            kill -0 $SERVER_PID
+            valgrind --error-exitcode=1 --leak-check=full \
+                     --errors-for-leak-kinds=definite \
+                     --show-leak-kinds=definite \
+                     ./tests/unit.test
+            RC=$?
+            kill $SERVER_PID 2>/dev/null || true
+            exit $RC
+          '
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fwtpm-valgrind-logs-${{ matrix.name }}
+          path: |
+            /tmp/fwtpm_check_*.log
+            /tmp/fwtpm_server.log
+            test-suite.log
+            tests/*.log
+            config.log
+          retention-days: 5

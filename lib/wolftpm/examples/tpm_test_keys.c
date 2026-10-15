@@ -1,0 +1,753 @@
+/* tpm_test_keys.c
+ *
+ * Copyright (C) 2006-2026 wolfSSL Inc.
+ *
+ * This file is part of wolfTPM.
+ *
+ * wolfTPM is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * wolfTPM is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
+#ifdef HAVE_CONFIG_H
+    #include <config.h>
+#endif
+
+/* use ANSI stdio for support of format strings, must be set before
+ * including stdio.h
+ */
+#if defined(__MINGW32__) || defined(__MINGW64__)
+    #define __USE_MINGW_ANSI_STDIO 1
+#endif
+#ifdef _MSC_VER
+    /* hide fopen warnings on Windows Visual Studio */
+    #define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "tpm_test.h"
+#include "tpm_test_keys.h"
+#include <wolftpm/tpm2_wrap.h>
+
+#include <stdio.h>
+
+#ifdef WOLFTPM_ZEPHYR
+    #include <zephyr/fs/fs.h>
+    #define XFILE struct fs_file_t*
+    /* Note: Other filesystem macros (XFOPEN, XFCLOSE etc) are already defined
+     * in wolfSSL's wc_port.h for Zephyr */
+#else
+    #define XFILE FILE*
+#endif
+
+#ifndef RSA_FILENAME
+    #define RSA_FILENAME  "rsa_test_blob.raw"
+#endif
+
+#ifndef ECC_FILENAME
+    #define ECC_FILENAME  "ecc_test_blob.raw"
+#endif
+
+#ifndef WOLFTPM2_NO_WRAPPER
+
+int writeBin(const char* filename, const byte *buf, word32 bufSz)
+{
+    int rc = TPM_RC_FAILURE;
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    XFILE fp = NULL;
+    size_t fileSz = 0;
+#endif
+
+    if (filename == NULL || buf == NULL)
+        return BAD_FUNC_ARG;
+
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    fp = XFOPEN(filename, "wb");
+    if (fp != XBADFILE) {
+        fileSz = XFWRITE(buf, 1, bufSz, fp);
+        /* sanity check */
+        if (fileSz == (word32)bufSz) {
+            rc = TPM_RC_SUCCESS;
+        }
+    #ifdef DEBUG_WOLFTPM
+        printf("Wrote %d bytes to %s\n", (int)fileSz, filename);
+    #endif
+        XFCLOSE(fp);
+    }
+#else
+    (void)bufSz;
+#endif
+    return rc;
+}
+
+int readBin(const char* filename, byte *buf, word32* bufSz)
+{
+    int rc = TPM_RC_FAILURE;
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    XFILE  fp = NULL;
+    size_t fileSz = 0;
+    size_t bytes_read = 0;
+#endif
+
+    if (filename == NULL || buf == NULL)
+        return BAD_FUNC_ARG;
+
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    fp = XFOPEN(filename, "rb");
+    if (fp != XBADFILE) {
+        XFSEEK(fp, 0, XSEEK_END);
+        fileSz = XFTELL(fp);
+        XREWIND(fp);
+        if (fileSz > (size_t)*bufSz) {
+            printf("File size check failed\n");
+            rc = BUFFER_E;
+        }
+        else {
+            *bufSz = (int)fileSz;
+        #ifdef DEBUG_WOLFTPM
+            printf("Reading %d bytes from %s\n", (int)fileSz, filename);
+        #endif
+            bytes_read = XFREAD(buf, 1, fileSz, fp);
+            if (bytes_read == fileSz) {
+                rc = TPM_RC_SUCCESS;
+            }
+        }
+        XFCLOSE(fp);
+    }
+    else {
+        rc = BUFFER_E;
+        printf("File %s not found!\n", filename);
+    }
+#else
+    (void)bufSz;
+#endif /* !NO_FILESYSTEM && !NO_WRITE_TEMP_FILES */
+    return rc;
+}
+
+int writeKeyBlob(const char* filename,
+                        WOLFTPM2_KEYBLOB* key)
+{
+    int rc = TPM_RC_FAILURE;
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    XFILE  fp = NULL;
+    size_t fileSz = 0;
+    size_t expectedSz;
+    byte pubAreaBuffer[sizeof(TPM2B_PUBLIC)];
+    int pubAreaSize;
+
+    fp = XFOPEN(filename, "wb");
+    if (fp == XBADFILE) {
+        printf("writeKeyBlob: cannot open %s for writing\n", filename);
+        return TPM_RC_FAILURE;
+    }
+
+    /* Make publicArea in encoded format to eliminate empty fields,
+     * save space */
+    rc = TPM2_AppendPublic(pubAreaBuffer, (word32)sizeof(pubAreaBuffer),
+        &pubAreaSize, &key->pub);
+    if (rc != TPM_RC_SUCCESS) {
+        XFCLOSE(fp);
+        return rc;
+    }
+    if (pubAreaSize != (key->pub.size + (int)sizeof(key->pub.size))) {
+        printf("writeKeyBlob: Sanity check for publicArea size failed\n");
+        XFCLOSE(fp);
+        return BUFFER_E;
+    }
+#ifdef WOLFTPM_DEBUG_VERBOSE
+    TPM2_PrintBin(pubAreaBuffer, pubAreaSize);
+#endif
+    /* Write size marker for the public part */
+    fileSz += XFWRITE(&key->pub.size, 1, sizeof(key->pub.size), fp);
+    /* Write the public part with bytes aligned */
+    fileSz += XFWRITE(pubAreaBuffer, 1, sizeof(UINT16) + key->pub.size, fp);
+    /* Write the private part, size marker is included */
+    fileSz += XFWRITE(&key->priv, 1, sizeof(UINT16) + key->priv.size, fp);
+    XFCLOSE(fp);
+
+    expectedSz = sizeof(key->pub.size)
+               + sizeof(UINT16) + key->pub.size
+               + sizeof(UINT16) + key->priv.size;
+    printf("Wrote %d bytes to %s\n", (int)fileSz, filename);
+    if (fileSz != expectedSz) {
+        printf("writeKeyBlob: short write %d/%d to %s\n",
+            (int)fileSz, (int)expectedSz, filename);
+        return TPM_RC_FAILURE;
+    }
+    rc = TPM_RC_SUCCESS;
+#else
+    /* No-op success on embedded builds without a filesystem; preserves the
+     * pre-fix ABI so callers like keygen.c don't fail unconditionally. */
+    rc = TPM_RC_SUCCESS;
+    (void)filename;
+    (void)key;
+#endif /* !NO_FILESYSTEM && !NO_WRITE_TEMP_FILES */
+    return rc;
+}
+
+int readKeyBlob(const char* filename, WOLFTPM2_KEYBLOB* key)
+{
+    int rc = 0;
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    XFILE  fp = NULL;
+    size_t fileSz = 0;
+    size_t bytes_read = 0;
+    byte pubAreaBuffer[sizeof(TPM2B_PUBLIC)];
+    int pubAreaSize;
+
+    XMEMSET(key, 0, sizeof(WOLFTPM2_KEYBLOB));
+
+    fp = XFOPEN(filename, "rb");
+    if (fp != XBADFILE) {
+        XFSEEK(fp, 0, XSEEK_END);
+        fileSz = XFTELL(fp);
+        XREWIND(fp);
+        if (fileSz > sizeof(key->priv) + sizeof(key->pub)) {
+            printf("File size check failed\n");
+            rc = BUFFER_E; goto exit;
+        }
+        printf("Reading %d bytes from %s\n", (int)fileSz, filename);
+
+        bytes_read = XFREAD(&key->pub.size, 1, sizeof(key->pub.size), fp);
+        if (bytes_read != sizeof(key->pub.size)) {
+            printf("Read %zu, expected size marker of %zu bytes\n",
+                bytes_read, sizeof(key->pub.size));
+            rc = BUFFER_E;
+            goto exit;
+        }
+        fileSz -= bytes_read;
+        if (sizeof(UINT16) + key->pub.size > sizeof(pubAreaBuffer)) {
+            printf("Public key size is too large\n");
+            rc = BUFFER_E; goto exit;
+        }
+        bytes_read = XFREAD(pubAreaBuffer, 1,
+            sizeof(UINT16) + key->pub.size, fp);
+        if (bytes_read != (sizeof(UINT16) + key->pub.size)) {
+            printf("Read %zu, expected public blob %zu bytes\n",
+                bytes_read, sizeof(UINT16) + key->pub.size);
+            rc = BUFFER_E;
+            goto exit;
+        }
+        fileSz -= bytes_read; /* Reminder bytes for private key part */
+
+        /* Decode the byte stream into a publicArea structure ready for use */
+        rc = TPM2_ParsePublic(&key->pub, pubAreaBuffer,
+            sizeof(UINT16) + key->pub.size, &pubAreaSize);
+        if (rc != TPM_RC_SUCCESS) {
+            goto exit;
+        }
+    #ifdef DEBUG_WOLFTPM
+        TPM2_PrintPublicArea(&key->pub);
+    #endif
+
+        if (fileSz > 0) {
+            printf("Reading the private part of the key\n");
+            /* Read and validate the size marker before the buffer so a
+             * crafted file cannot overflow priv */
+            bytes_read = XFREAD(&key->priv.size, 1, sizeof(key->priv.size), fp);
+            if (bytes_read != sizeof(key->priv.size)) {
+                printf("Read %zu, expected private size marker of %zu bytes\n",
+                    bytes_read, sizeof(key->priv.size));
+                rc = BUFFER_E; goto exit;
+            }
+            if (key->priv.size > sizeof(key->priv.buffer)) {
+                printf("Private key size is too large\n");
+                rc = BUFFER_E; goto exit;
+            }
+            bytes_read = XFREAD(key->priv.buffer, 1, key->priv.size, fp);
+            if (bytes_read != key->priv.size) {
+                printf("Read %zu, expected private blob %zu bytes\n",
+                    bytes_read, (size_t)key->priv.size);
+                rc = BUFFER_E; goto exit;
+            }
+            rc = 0; /* success */
+        }
+        if (key->priv.size == 0) {
+            printf("No private key loaded\n");
+        }
+
+        /* sanity check the sizes */
+        if (pubAreaSize != (key->pub.size + (int)sizeof(key->pub.size)) ||
+             key->priv.size > sizeof(key->priv.buffer)) {
+            printf("Struct size check failed (pub %d, priv %d)\n",
+                   key->pub.size, key->priv.size);
+            rc = BUFFER_E;
+        }
+    }
+    else {
+        rc = BUFFER_E;
+        printf("File %s not found!\n", filename);
+        printf("Keys can be generated by running:\n"
+               "  ./examples/keygen/keygen rsa_test_blob.raw -rsa -t\n"
+               "  ./examples/keygen/keygen ecc_test_blob.raw -ecc -t\n");
+    }
+
+exit:
+    if (fp)
+      XFCLOSE(fp);
+#else
+    (void)filename;
+    (void)key;
+    rc = NOT_COMPILED_IN;
+#endif /* !NO_FILESYSTEM && !NO_WRITE_TEMP_FILES */
+    return rc;
+}
+
+int createAndLoadKey(WOLFTPM2_DEV* pDev, WOLFTPM2_KEY* key,
+    WOLFTPM2_HANDLE* parent, const char* filename, const byte* auth, int authSz,
+    TPMT_PUBLIC* publicTemplate)
+{
+    int rc;
+    WOLFTPM2_KEYBLOB keyblob;
+
+    rc = readAndLoadKey(pDev, key, parent, filename, auth, authSz);
+    if (rc == 0) {
+        return rc;
+    }
+    /* read failed, so let's create a new key */
+
+    /* if a public template was not provided we cannot create */
+    if (publicTemplate == NULL) {
+        return BUFFER_E;
+    }
+
+
+    XMEMSET(&keyblob, 0, sizeof(keyblob));
+    rc = wolfTPM2_CreateKey(pDev, &keyblob, parent,
+                            publicTemplate, auth, authSz);
+    if (rc != TPM_RC_SUCCESS) {
+        printf("wolfTPM2_CreateKey failed\n");
+        return rc;
+    }
+    printf("Created new key (pub %d, priv %d bytes)\n",
+        keyblob.pub.size, keyblob.priv.size);
+
+    /* Save key as encrypted blob to the disk */
+#if !defined(NO_FILESYSTEM) && !defined(NO_WRITE_TEMP_FILES)
+    rc = writeKeyBlob(filename, &keyblob);
+    if (rc != 0) {
+        return rc;
+    }
+#endif
+
+    /* Load Key */
+    rc = wolfTPM2_LoadKey(pDev, &keyblob, parent);
+    if (rc != TPM_RC_SUCCESS) {
+        printf("wolfTPM2_LoadKey failed\n");
+        return rc;
+    }
+    printf("Loaded key to 0x%x\n",
+        (word32)keyblob.handle.hndl);
+
+    key->handle = keyblob.handle;
+    key->pub    = keyblob.pub;
+    key->handle.auth.size = authSz;
+    XMEMCPY(key->handle.auth.buffer, auth, authSz);
+
+    return rc;
+}
+
+int readAndLoadKey(WOLFTPM2_DEV* pDev, WOLFTPM2_KEY* key,
+    WOLFTPM2_HANDLE* parent, const char* filename, const byte* auth, int authSz)
+{
+    int rc;
+    WOLFTPM2_KEYBLOB keyblob;
+
+    /* clear output key buffer */
+    XMEMSET(key, 0, sizeof(WOLFTPM2_KEY));
+
+    rc = readKeyBlob(filename, &keyblob);
+    if (rc != 0) {
+        /* if does not exist - create */
+
+        return rc;
+    }
+
+    rc = wolfTPM2_LoadKey(pDev, &keyblob, parent);
+    if (rc != TPM_RC_SUCCESS) {
+        printf("wolfTPM2_LoadKey failed\n");
+        return rc;
+    }
+    printf("Loaded key to 0x%x\n",
+        (word32)keyblob.handle.hndl);
+
+    key->handle = keyblob.handle;
+    key->pub    = keyblob.pub;
+    key->handle.auth.size = authSz;
+    XMEMCPY(key->handle.auth.buffer, auth, authSz);
+
+    return rc;
+}
+
+int getPrimaryStoragekey(WOLFTPM2_DEV* pDev, WOLFTPM2_KEY* pStorageKey,
+    TPM_ALG_ID alg)
+{
+    int rc;
+    TPM_HANDLE handle;
+
+    if (alg == TPM_ALG_RSA)
+        handle = TPM2_DEMO_STORAGE_KEY_HANDLE;
+    else if (alg == TPM_ALG_ECC)
+        handle = TPM2_DEMO_STORAGE_EC_KEY_HANDLE;
+    else {
+        printf("Invalid SRK alg %x\n", alg);
+        return BAD_FUNC_ARG;
+    }
+
+    /* See if SRK already exists */
+    rc = wolfTPM2_ReadPublicKey(pDev, pStorageKey, handle);
+    if (rc != 0) {
+        /* Create primary storage key */
+        rc = wolfTPM2_CreateSRK(pDev, pStorageKey, alg,
+            (byte*)gStorageKeyAuth, sizeof(gStorageKeyAuth)-1);
+    #ifndef WOLFTPM_WINAPI
+        if (rc == TPM_RC_SUCCESS) {
+            /* Move storage key into persistent NV */
+            rc = wolfTPM2_NVStoreKey(pDev, TPM_RH_OWNER, pStorageKey, handle);
+        }
+    #endif
+    }
+    else {
+        /* specify auth password for storage key */
+        pStorageKey->handle.auth.size = sizeof(gStorageKeyAuth)-1;
+        XMEMCPY(pStorageKey->handle.auth.buffer, gStorageKeyAuth,
+                pStorageKey->handle.auth.size);
+    }
+    if (rc != 0) {
+        printf("Loading SRK: Storage failed 0x%x: %s\n", rc,
+            TPM2_GetRCString(rc));
+        return rc;
+    }
+    printf("Loading SRK: Storage 0x%x (%d bytes)\n",
+        (word32)pStorageKey->handle.hndl, pStorageKey->pub.size);
+    return rc;
+}
+
+#if defined(WOLFTPM_MLDSA) || defined(WOLFTPM_MLKEM)
+int getPrimaryParamEncKey(WOLFTPM2_DEV* pDev, WOLFTPM2_SESSION* session,
+    WOLFTPM2_KEY* pqcKey, TPM_ALG_ID pqcAlg, int paramSet, int paramEncAlg)
+{
+    int rc;
+    TPMT_PUBLIC publicTemplate;
+#ifdef WOLFTPM_MLDSA
+    WOLFTPM2_KEY saltKey; /* transient SRK salt for the ML-DSA bound session */
+#if !defined(NO_RSA)
+    TPM_ALG_ID saltAlg = TPM_ALG_RSA;
+#else
+    TPM_ALG_ID saltAlg = TPM_ALG_ECC;
+#endif
+#endif
+    const char* pqcAuth = "pqcParamEnc"; /* primary userAuth; the bind auth for
+                                          * ML-DSA, immaterial for the ML-KEM
+                                          * salt key */
+
+    if (pDev == NULL || session == NULL || pqcKey == NULL)
+        return BAD_FUNC_ARG;
+
+    XMEMSET(pqcKey, 0, sizeof(*pqcKey));
+    XMEMSET(&publicTemplate, 0, sizeof(publicTemplate));
+#ifdef WOLFTPM_MLDSA
+    XMEMSET(&saltKey, 0, sizeof(saltKey));
+#endif
+
+    if (pqcAlg == TPM_ALG_MLKEM) {
+    #ifdef WOLFTPM_MLKEM
+        /* ML-KEM salt key: restricted decryption, which requires a symmetric
+         * definition (a TPM rejects a restricted key without one). */
+        rc = wolfTPM2_GetKeyTemplate_MLKEM(&publicTemplate,
+            TPMA_OBJECT_decrypt | TPMA_OBJECT_restricted |
+            TPMA_OBJECT_fixedTPM | TPMA_OBJECT_fixedParent |
+            TPMA_OBJECT_sensitiveDataOrigin | TPMA_OBJECT_userWithAuth |
+            TPMA_OBJECT_noDA, (TPMI_MLKEM_PARAMETER_SET)paramSet);
+        if (rc == TPM_RC_SUCCESS) {
+            publicTemplate.parameters.mlkemDetail.symmetric.algorithm =
+                TPM_ALG_AES;
+            publicTemplate.parameters.mlkemDetail.symmetric.keyBits.aes = 128;
+            publicTemplate.parameters.mlkemDetail.symmetric.mode.aes =
+                TPM_ALG_CFB;
+        }
+    #else
+        (void)paramSet;
+        return NOT_COMPILED_IN;
+    #endif
+    }
+    else if (pqcAlg == TPM_ALG_MLDSA) {
+    #ifdef WOLFTPM_MLDSA
+        /* ML-DSA is sign-only; it can only be a session bind entity. */
+        rc = wolfTPM2_GetKeyTemplate_MLDSA(&publicTemplate,
+            TPMA_OBJECT_sign | TPMA_OBJECT_fixedTPM |
+            TPMA_OBJECT_fixedParent | TPMA_OBJECT_sensitiveDataOrigin |
+            TPMA_OBJECT_userWithAuth | TPMA_OBJECT_noDA,
+            (TPMI_MLDSA_PARAMETER_SET)paramSet, 0);
+    #else
+        (void)paramSet;
+        return NOT_COMPILED_IN;
+    #endif
+    }
+    else {
+        return BAD_FUNC_ARG;
+    }
+    if (rc != TPM_RC_SUCCESS)
+        return rc;
+
+    rc = wolfTPM2_CreatePrimaryKey(pDev, pqcKey, TPM_RH_OWNER, &publicTemplate,
+        (const byte*)pqcAuth, (int)XSTRLEN(pqcAuth));
+    if (rc != TPM_RC_SUCCESS)
+        return rc;
+    printf("PQC param-enc key: %s primary 0x%x\n", TPM2_GetAlgName(pqcAlg),
+        (word32)pqcKey->handle.hndl);
+
+    /* ML-KEM keys the session salt (tpmKey). ML-DSA is sign-only so it can
+     * only bind; a transient SRK provides the salt (confidentiality) while the
+     * ML-DSA key supplies the binding. */
+    if (pqcAlg == TPM_ALG_MLKEM) {
+        rc = wolfTPM2_StartSession(pDev, session, pqcKey, NULL,
+            TPM_SE_HMAC, paramEncAlg);
+    }
+    else {
+    #ifdef WOLFTPM_MLDSA
+        rc = wolfTPM2_CreateSRK(pDev, &saltKey, saltAlg, NULL, 0);
+        if (rc == TPM_RC_SUCCESS) {
+            rc = wolfTPM2_StartSession(pDev, session, &saltKey,
+                &pqcKey->handle, TPM_SE_HMAC, paramEncAlg);
+            /* salt is baked into the session key; drop the salt key handle */
+            wolfTPM2_UnloadHandle(pDev, &saltKey.handle);
+        }
+    #endif
+    }
+    if (rc != TPM_RC_SUCCESS) {
+        printf("PQC param-enc StartSession failed 0x%x: %s\n", rc,
+            TPM2_GetRCString(rc));
+        wolfTPM2_UnloadHandle(pDev, &pqcKey->handle);
+        XMEMSET(pqcKey, 0, sizeof(*pqcKey));
+    }
+    return rc;
+}
+
+/* Returns 1 and sets the alg and paramSet outputs for a valid PQC value, -1 if
+ * the value names a PQC algorithm but with an unsupported parameter set
+ * (message printed), or 0 if it is not a PQC option. Outputs are committed
+ * only on success. An empty suffix ("mlkem=") uses the default like "mlkem". */
+int parsePqcParamSet(const char* val, TPM_ALG_ID* alg, int* paramSet)
+{
+    int n;
+    int localSet;
+
+    if (val == NULL || alg == NULL || paramSet == NULL)
+        return 0;
+#ifdef WOLFTPM_MLKEM
+    if (XSTRCMP(val, "mlkem") == 0 ||
+            XSTRNCMP(val, "mlkem=", 6) == 0) {
+        n = (val[5] == '=' && val[6] != '\0') ? XATOI(&val[6]) : 768;
+        if (n == 512)
+            localSet = TPM_MLKEM_512;
+        else if (n == 768)
+            localSet = TPM_MLKEM_768;
+        else if (n == 1024)
+            localSet = TPM_MLKEM_1024;
+        else {
+            printf("Invalid ML-KEM parameter set: %d (use 512, 768, or 1024)\n",
+                n);
+            return -1;
+        }
+        *alg = TPM_ALG_MLKEM;
+        *paramSet = localSet;
+        return 1;
+    }
+#endif
+#ifdef WOLFTPM_MLDSA
+    if (XSTRCMP(val, "mldsa") == 0 ||
+            XSTRNCMP(val, "mldsa=", 6) == 0) {
+        n = (val[5] == '=' && val[6] != '\0') ? XATOI(&val[6]) : 65;
+        if (n == 44)
+            localSet = TPM_MLDSA_44;
+        else if (n == 65)
+            localSet = TPM_MLDSA_65;
+        else if (n == 87)
+            localSet = TPM_MLDSA_87;
+        else {
+            printf("Invalid ML-DSA parameter set: %d (use 44, 65, or 87)\n", n);
+            return -1;
+        }
+        *alg = TPM_ALG_MLDSA;
+        *paramSet = localSet;
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+int parsePqcParamEncArg(const char* arg, TPM_ALG_ID* alg, int* paramSet)
+{
+    if (arg == NULL || arg[0] != '-')
+        return 0;
+    return parsePqcParamSet(arg + 1, alg, paramSet);
+}
+#endif /* WOLFTPM_MLDSA || WOLFTPM_MLKEM */
+
+int getRSAkey(WOLFTPM2_DEV* pDev, WOLFTPM2_KEY* pStorageKey, WOLFTPM2_KEY* key,
+    void* pWolfRsaKey, int tpmDevId, const byte* auth, int authSz,
+    TPMT_PUBLIC* publicTemplate)
+{
+    int rc = 0;
+
+    /* Create/Load RSA key */
+    rc = createAndLoadKey(pDev, key, &pStorageKey->handle,
+                        RSA_FILENAME,
+                        auth, authSz, publicTemplate);
+    if (rc != 0) {
+        return rc;
+    }
+
+#if !defined(WOLFTPM2_NO_WOLFCRYPT) && !defined(NO_RSA)
+    if (pWolfRsaKey) {
+        /* setup wolf RSA key with TPM deviceID, so crypto callbacks are used */
+        rc = wc_InitRsaKey_ex((RsaKey*)pWolfRsaKey, NULL, tpmDevId);
+        if (rc != 0) return rc;
+
+        /* load public portion of key into wolf RSA Key */
+        rc = wolfTPM2_RsaKey_TpmToWolf(pDev, key, (RsaKey*)pWolfRsaKey);
+    }
+#else
+    (void)pWolfRsaKey;
+    (void)tpmDevId;
+#endif /* !WOLFTPM2_NO_WOLFCRYPT && !NO_RSA */
+
+    return rc;
+}
+
+int getECCkey(WOLFTPM2_DEV* pDev, WOLFTPM2_KEY* pStorageKey, WOLFTPM2_KEY* key,
+    void* pWolfEccKey, int tpmDevId, const byte* auth, int authSz,
+    TPMT_PUBLIC* publicTemplate)
+{
+    int rc = 0;
+
+    /* Create/Load ECC key */
+    rc = createAndLoadKey(pDev, key, &pStorageKey->handle,
+                        ECC_FILENAME,
+                        auth, authSz, publicTemplate);
+    if (rc != 0) {
+        return rc;
+    }
+#if !defined(WOLFTPM2_NO_WOLFCRYPT) && defined(HAVE_ECC) && !defined(NO_ASN)
+    if (pWolfEccKey) {
+        /* setup wolf ECC key with TPM deviceID, so crypto callbacks are used */
+        rc = wc_ecc_init_ex((ecc_key*)pWolfEccKey, NULL, tpmDevId);
+        if (rc != 0) return rc;
+
+        /* load public portion of key into wolf ECC Key */
+        rc = wolfTPM2_EccKey_TpmToWolf(pDev, key, (ecc_key*)pWolfEccKey);
+    }
+#else
+    (void)pWolfEccKey;
+    (void)tpmDevId;
+#endif /* !WOLFTPM2_NO_WRAPPER && HAVE_ECC */
+
+    return rc;
+}
+
+int loadFile(const char* fname, byte** buf, size_t* bufLen)
+{
+    int ret = 0;
+#if !defined(NO_FILESYSTEM)
+    ssize_t fileSz, readLen;
+    XFILE fp;
+
+    if (fname == NULL || buf == NULL || bufLen == NULL)
+        return BAD_FUNC_ARG;
+
+    /* open file (read-only binary) */
+    fp = XFOPEN(fname, "rb");
+    if (fp == XBADFILE) {
+        fprintf(stderr, "Error loading %s\n", fname);
+        return BUFFER_E;
+    }
+
+    XFSEEK(fp, 0, XSEEK_END);
+    fileSz = XFTELL(fp);
+    XREWIND(fp);
+    if (fileSz > 0) {
+        if (*buf == NULL) {
+        #if !defined(WOLFTPM2_NO_HEAP)
+            *buf = (byte*)XMALLOC(fileSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+            if (*buf == NULL)
+                ret = MEMORY_E;
+        #else
+            ret = MEMORY_E;
+        #endif
+        }
+        else if (*buf != NULL && fileSz > (ssize_t)*bufLen) {
+            ret = BUFFER_E;
+        }
+        *bufLen = (size_t)fileSz;
+        if (ret == 0) {
+            readLen = XFREAD(*buf, 1, *bufLen, fp);
+            ret = (readLen == (ssize_t)*bufLen) ? 0 : -1;
+        }
+    }
+    else {
+        ret = BUFFER_E;
+    }
+    XFCLOSE(fp);
+#else
+    (void)fname;
+    (void)buf;
+    (void)bufLen;
+    ret = NOT_COMPILED_IN;
+#endif /* !NO_FILESYSTEM */
+    return ret;
+}
+
+
+static signed char hexCharToByte(signed char ch)
+{
+    signed char ret = (signed char)ch;
+    if (ret >= '0' && ret <= '9')
+        ret -= '0';
+    else if (ret >= 'A' && ret <= 'F')
+        ret -= 'A' - 10;
+    else if (ret >= 'a' && ret <= 'f')
+        ret -= 'a' - 10;
+    else
+        ret = -1; /* error case - return code must be signed */
+    return ret;
+}
+int hexToByte(const char *hex, unsigned char *output, unsigned long sz)
+{
+    int outSz = 0;
+    word32 i;
+    for (i = 0; i < sz; i+=2) {
+        signed char ch1, ch2;
+        ch1 = hexCharToByte(hex[i]);
+        ch2 = hexCharToByte(hex[i+1]);
+        if ((ch1 < 0) || (ch2 < 0)) {
+            return -1;
+        }
+        output[outSz++] = (unsigned char)((ch1 << 4) + ch2);
+    }
+    return outSz;
+}
+
+void printHexString(const unsigned char* bin, unsigned long sz,
+    unsigned long maxLine)
+{
+    unsigned long i;
+    printf("\t");
+    for (i = 0; i < sz; i++) {
+        printf("%02x", bin[i]);
+        if (((i+1) % maxLine) == 0 && i+1 != sz)
+            printf("\n\t");
+    }
+    printf("\n");
+}
+
+#endif /* !WOLFTPM2_NO_WRAPPER */

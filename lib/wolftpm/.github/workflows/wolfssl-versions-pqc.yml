@@ -1,0 +1,146 @@
+name: wolfSSL Version Matrix
+
+on:
+  push:
+    branches: [ 'master', 'main', 'release/**' ]
+  pull_request:
+    branches: [ '*' ]
+    types: [opened, synchronize, reopened, ready_for_review]
+  repository_dispatch:
+    types: [nightly-trigger]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Auto-resolve the latest -stable wolfSSL tag (and its PQC eligibility) via
+  # the shared reusable workflow, so this file never needs a version bump.
+  resolve-wolfssl:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    uses: ./.github/workflows/_resolve-wolfssl.yml
+
+  # Build the wolfTPM PQC test matrix from the resolved latest -stable.
+  #   * v5.8.0-stable: fixed backward-compat floor, classic (no PQC).
+  #   * latest -stable: auto-resolved. Classic on v5.9.1 (and earlier); PQC
+  #     (v185 ML-DSA/ML-KEM) only once latest is > v5.9.1, i.e. v5.9.2 onward,
+  #     because the wc_MlDsaKey_* API the v1.85 code uses lands post-v5.9.1.
+  #   * master: always PQC, to surface upstream drift.
+  # So today this runs v5.8.0 + v5.9.1 classic and master PQC; when v5.9.2
+  # ships it is picked up automatically and gains its own PQC row.
+  discover-versions:
+    name: Resolve wolfSSL version matrix
+    needs: resolve-wolfssl
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build wolfTPM version matrix
+        id: set-matrix
+        env:
+          LATEST: ${{ needs.resolve-wolfssl.outputs.latest_stable }}
+          LATEST_PQC: ${{ needs.resolve-wolfssl.outputs.latest_pqc }}
+        run: |
+          set -euo pipefail
+          MATRIX=$(jq -nc --arg latest "$LATEST" --argjson latest_pqc "$LATEST_PQC" '{
+            include: [
+              {"wolfssl-version":"v5.8.0-stable","wolfssl-ref":"v5.8.0-stable","cache-key":"wolfssl-nopqc-v5.8.0-v1","pqc":false},
+              {"wolfssl-version":$latest,"wolfssl-ref":$latest,"cache-key":("wolfssl-" + (if $latest_pqc then "pqc" else "nopqc" end) + "-" + $latest + "-v1"),"pqc":$latest_pqc},
+              {"wolfssl-version":"master","wolfssl-ref":"master","cache-key":"","pqc":true}
+            ]
+          }')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  pqc-build-test:
+    name: wolfSSL ${{ matrix.wolfssl-version }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: discover-versions
+    runs-on: ubuntu-latest
+    # Build tools baked into the CI image — no apt mirror on the happy path.
+    container:
+      image: ghcr.io/wolfssl/wolftpm-ci:v1.0
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-versions.outputs.matrix) }}
+
+    steps:
+      - name: Checkout wolfTPM
+        uses: actions/checkout@v4
+
+      - name: Cache wolfSSL ${{ matrix.wolfssl-version }}
+        if: matrix.wolfssl-version != 'master'
+        id: cache-wolfssl
+        uses: actions/cache@v4
+        with:
+          path: ~/wolfssl-install
+          key: ${{ matrix.cache-key }}
+
+      - name: Build wolfSSL ${{ matrix.wolfssl-version }}
+        if: matrix.wolfssl-version == 'master' || steps.cache-wolfssl.outputs.cache-hit != 'true'
+        env:
+          PQC: ${{ matrix.pqc }}
+        run: |
+          cd ~
+          git clone --depth 1 --branch ${{ matrix.wolfssl-ref }} \
+              https://github.com/wolfSSL/wolfssl.git
+          cd wolfssl
+          ./autogen.sh
+          # PQC rows pull in ML-DSA + ML-KEM; non-PQC rows cover wolfSSL
+          # versions that predate the wc_MlDsaKey_* rename (PR #10436).
+          if [ "$PQC" = "true" ]; then
+            PQC_FLAGS="--enable-dilithium --enable-mlkem --enable-experimental"
+          else
+            PQC_FLAGS=""
+          fi
+          ./configure --enable-wolftpm --enable-pkcallbacks --enable-keygen \
+                      $PQC_FLAGS \
+                      --enable-harden CFLAGS="-DWC_RSA_NO_PADDING" \
+                      --prefix=$HOME/wolfssl-install
+          make -j"$(nproc)"
+          make install
+
+      - name: wolfSSL version info
+        run: |
+          grep LIBWOLFSSL_VERSION_STRING $HOME/wolfssl-install/include/wolfssl/version.h
+          grep LIBWOLFSSL_VERSION_HEX $HOME/wolfssl-install/include/wolfssl/version.h
+
+      - name: Build wolfTPM with v1.85 + fwTPM (PQC)
+        if: matrix.pqc
+        run: |
+          ./autogen.sh
+          CPPFLAGS="-I$HOME/wolfssl-install/include" \
+          LDFLAGS="-L$HOME/wolfssl-install/lib -Wl,-rpath,$HOME/wolfssl-install/lib" \
+            ./configure --enable-v185 --enable-fwtpm --enable-debug=verbose
+          make -j"$(nproc)"
+
+      - name: Build wolfTPM with fwTPM (no PQC)
+        if: '!matrix.pqc'
+        run: |
+          ./autogen.sh
+          CPPFLAGS="-I$HOME/wolfssl-install/include" \
+          LDFLAGS="-L$HOME/wolfssl-install/lib -Wl,-rpath,$HOME/wolfssl-install/lib" \
+            ./configure --enable-fwtpm --disable-v185 --enable-debug=verbose
+          make -j"$(nproc)"
+
+      - name: Run fwtpm_unit.test
+        run: |
+          export LD_LIBRARY_PATH=$HOME/wolfssl-install/lib
+          ./tests/fwtpm_unit.test
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wolfssl-versions-${{ matrix.wolfssl-version }}-logs
+          path: |
+            config.log
+            tests/*.log
+            test-suite.log
+          retention-days: 5
