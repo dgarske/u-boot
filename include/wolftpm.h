@@ -27,6 +27,17 @@ void TPM2_IFX_PrintInfo(WOLFTPM2_CAPS *caps);
 int TPM2_PCRs_Print(void);
 int TPM2_Init_Device(WOLFTPM2_DEV *dev, void *userCtx);
 
+/**
+ * TPM2_Autostart_Device() - init wolfTPM, start up the TPM and run a self test
+ *
+ * For board code that uses wolfTPM directly. It avoids tpm_auto_start() from
+ * tpm_api.h, whose TPM2 definitions clash with the wolfTPM headers.
+ *
+ * @dev: wolfTPM device context to initialize
+ * Return: TPM_RC_SUCCESS, or a wolfTPM / TPM response code
+ */
+int TPM2_Autostart_Device(WOLFTPM2_DEV *dev);
+
 #ifdef __cplusplus
 }
 #endif

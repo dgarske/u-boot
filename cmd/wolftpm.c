@@ -163,37 +163,11 @@ int do_tpm2_autostart(struct cmd_tbl *cmdtp, int flag, int argc,
 {
 	int rc;
 	WOLFTPM2_DEV dev;
-	Startup_In startupIn;
 
 	if (argc != 1)
 		return CMD_RET_USAGE;
 
-	/* Init the TPM2 device */
-	rc = TPM2_Init_Device(&dev, NULL);
-	if (rc != TPM_RC_SUCCESS)
-		return rc;
-
-	/*
-	 * Issue TPM2_Startup directly: wolfTPM2_Reset() declines startup when
-	 * WOLFTPM_LINUX_DEV is set, but in U-Boot nothing else starts the TPM.
-	 */
-	memset(&startupIn, 0, sizeof(startupIn));
-	startupIn.startupType = TPM_SU_CLEAR;
-	rc = TPM2_Startup(&startupIn);
-	/* TPM_RC_INITIALIZE means already started - treat as success */
-	if (rc == TPM_RC_INITIALIZE)
-		rc = TPM_RC_SUCCESS;
-	if (rc != TPM_RC_SUCCESS) {
-		log_debug("TPM2_Startup failed 0x%x: %s\n", rc,
-			TPM2_GetRCString(rc));
-		return rc;
-	}
-
-	/* Perform a full self test */
-	rc = wolfTPM2_SelfTest(&dev);
-	if (rc != TPM_RC_SUCCESS)
-		log_debug("wolfTPM2_SelfTest failed 0x%x: %s\n", rc,
-			TPM2_GetRCString(rc));
+	rc = TPM2_Autostart_Device(&dev);
 
 	log_debug("tpm2 autostart: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 

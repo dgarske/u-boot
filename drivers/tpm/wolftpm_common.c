@@ -130,6 +130,40 @@ int TPM2_Init_Device(WOLFTPM2_DEV *dev, void *userCtx)
 	return rc;
 }
 
+int TPM2_Autostart_Device(WOLFTPM2_DEV *dev)
+{
+	int rc;
+	Startup_In startupIn;
+
+	rc = TPM2_Init_Device(dev, NULL);
+	if (rc != TPM_RC_SUCCESS)
+		return rc;
+
+	/*
+	 * Issue TPM2_Startup directly: wolfTPM2_Reset() declines startup when
+	 * WOLFTPM_LINUX_DEV is set, but in U-Boot nothing else starts the TPM.
+	 */
+	memset(&startupIn, 0, sizeof(startupIn));
+	startupIn.startupType = TPM_SU_CLEAR;
+	rc = TPM2_Startup(&startupIn);
+	/* TPM_RC_INITIALIZE means already started - treat as success */
+	if (rc == TPM_RC_INITIALIZE)
+		rc = TPM_RC_SUCCESS;
+	if (rc != TPM_RC_SUCCESS) {
+		log_debug("TPM2_Startup failed 0x%x: %s\n", rc,
+			  TPM2_GetRCString(rc));
+		return rc;
+	}
+
+	/* Perform a full self test */
+	rc = wolfTPM2_SelfTest(dev);
+	if (rc != TPM_RC_SUCCESS)
+		log_debug("wolfTPM2_SelfTest failed 0x%x: %s\n", rc,
+			  TPM2_GetRCString(rc));
+
+	return rc;
+}
+
 #endif /* WOLFTPM2_NO_WRAPPER */
 
 /******************************************************************************/

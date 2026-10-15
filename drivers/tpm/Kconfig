@@ -226,6 +226,16 @@ config WOLFTPM_LINUX_DEV
       U-Boot TPM driver model (tpm_xfer). On Linux, this uses /dev/tpm0.
       This is the recommended setting for U-Boot.
 
+config WOLFTPM_COMMAND_RETRIES
+    int "wolfTPM command retries"
+    depends on TPM_V2 && TPM_WOLF
+    default 3
+    help
+      Number of times wolfTPM resends a command when the TPM answers
+      TPM_RC_RETRY (sets WOLFTPM_MAX_RETRIES), for example on the first
+      authorized read of an NV index. 0 returns TPM_RC_RETRY to the
+      caller.
+
 config WOLFTPM_SLB9672
     bool "Enable support for Infineon SLB9672 TPM"
     depends on TPM_V2 && TPM_WOLF

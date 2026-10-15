@@ -97,6 +97,9 @@ extern "C" {
 	#define TPM_TIMEOUT_TRIES 10000
 #endif
 
+/* Resend a command the TPM answered with TPM_RC_RETRY */
+#define WOLFTPM_MAX_RETRIES CONFIG_WOLFTPM_COMMAND_RETRIES
+
 /* Add small delay between poll attempts to avoid tight spin loop */
 #define XTPM_WAIT() udelay(100)
 
