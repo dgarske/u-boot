@@ -1,0 +1,2690 @@
+/* fwtpm_nv.c
+ *
+ * Copyright (C) 2006-2026 wolfSSL Inc.
+ *
+ * This file is part of wolfTPM.
+ *
+ * wolfTPM is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * wolfTPM is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
+/* fwTPM NV Storage — TLV Journal Format
+ *
+ * NV image layout:
+ *   [FWTPM_NV_HEADER: 16 bytes]
+ *   [TLV entry 1] [TLV entry 2] ... [TLV entry N]
+ *   [0xFF... free space]
+ *
+ * Each TLV entry: [UINT16 tag][UINT16 length][byte value[length]]
+ * Journal semantics: latest entry with same tag+key wins.
+ * Compaction: on FWTPM_NV_Save(), writes only latest entries.
+ */
+
+#ifdef HAVE_CONFIG_H
+    #include <config.h>
+#endif
+
+#include <wolftpm/tpm2_types.h>
+
+#ifdef WOLFTPM_FWTPM
+
+#include <wolftpm/fwtpm/fwtpm.h>
+#include <wolftpm/fwtpm/fwtpm_nv.h>
+
+#include <wolfssl/wolfcrypt/hmac.h>
+
+#if !defined(NO_FILESYSTEM) && !defined(_WIN32)
+    #include <sys/stat.h>
+    #include <unistd.h>
+    #include <fcntl.h>
+#endif
+
+#define FWTPM_NV_KEY_SIZE       32
+#define FWTPM_NV_MAC_SIZE       WC_SHA256_DIGEST_SIZE
+
+#include <stdio.h>
+#include <string.h>
+
+/* TLV header size: tag(2) + length(2) */
+#define TLV_HDR_SIZE  4
+
+/* Append-only is active only when both the HAL opts in and the feature is
+ * built. Reading the field through this macro keeps the byte-addressable MAC
+ * write/verify and writePos validation active if a port sets appendOnly
+ * without WOLFTPM_FWTPM_NV_APPEND_ONLY (rather than silently dropping them). */
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    #define FW_NV_APPEND_ONLY(hal)  ((hal)->appendOnly)
+#else
+    #define FW_NV_APPEND_ONLY(hal)  (0)
+#endif
+
+/* ========================================================================= */
+/* File-based NV backend                                                     */
+/* ========================================================================= */
+
+#ifndef NO_FILESYSTEM
+
+static int FwNvFileRead(void* ctx, word32 offset, byte* buf, word32 size)
+{
+    const char* path = (const char*)ctx;
+    FILE* f;
+    int ret;
+
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return TPM_RC_FAILURE;
+    }
+
+    if (fseek(f, (long)offset, SEEK_SET) != 0) {
+        fclose(f);
+        return TPM_RC_FAILURE;
+    }
+
+    ret = (int)fread(buf, 1, size, f);
+    fclose(f);
+
+    if (ret != (int)size) {
+        return TPM_RC_FAILURE;
+    }
+
+    return TPM_RC_SUCCESS;
+}
+
+static int FwNvFileWrite(void* ctx, word32 offset, const byte* buf,
+    word32 size)
+{
+    const char* path = (const char*)ctx;
+    FILE* f;
+    int ret;
+    long fileSize;
+
+    /* The journal holds plaintext hierarchy seeds, auth values and private
+     * keys, so it must never be created (or left) group/other readable. */
+#if !defined(_WIN32)
+    int fd;
+    int oflags = O_RDWR | O_CREAT;
+    #ifdef O_CLOEXEC
+    oflags |= O_CLOEXEC;
+    #endif
+    #ifdef O_NOFOLLOW
+    oflags |= O_NOFOLLOW;
+    #endif
+    fd = open(path, oflags, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        return TPM_RC_FAILURE;
+    }
+    /* Tighten an existing journal a prior umask left too permissive. */
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        close(fd);
+        return TPM_RC_FAILURE;
+    }
+    f = fdopen(fd, "r+b");
+    if (f == NULL) {
+        close(fd);
+        return TPM_RC_FAILURE;
+    }
+#else
+    /* Open for read+write if exists, otherwise create */
+    f = fopen(path, "r+b");
+    if (f == NULL) {
+        f = fopen(path, "wb");
+        if (f == NULL) {
+            return TPM_RC_FAILURE;
+        }
+    }
+#endif
+
+    /* If writing past current end, extend with zeros */
+    fseek(f, 0, SEEK_END);
+    fileSize = ftell(f);
+    if ((long)offset > fileSize) {
+        byte zero = 0;
+        long i;
+        for (i = fileSize; i < (long)offset; i++) {
+            if (fwrite(&zero, 1, 1, f) != 1) {
+                fclose(f);
+                return TPM_RC_FAILURE;
+            }
+        }
+    }
+
+    if (fseek(f, (long)offset, SEEK_SET) != 0) {
+        fclose(f);
+        return TPM_RC_FAILURE;
+    }
+
+    ret = (int)fwrite(buf, 1, size, f);
+    /* Flush to stable storage so a crash cannot lose committed NV state */
+    if (fflush(f) != 0) {
+        fclose(f);
+        return TPM_RC_FAILURE;
+    }
+#if !defined(_WIN32)
+    if (fsync(fileno(f)) != 0) {
+        fclose(f);
+        return TPM_RC_FAILURE;
+    }
+#endif
+    fclose(f);
+
+    if (ret != (int)size) {
+        return TPM_RC_FAILURE;
+    }
+
+    return TPM_RC_SUCCESS;
+}
+
+static int FwNvFileErase(void* ctx, word32 offset, word32 size)
+{
+    const char* path = (const char*)ctx;
+#if !defined(_WIN32)
+    int fd;
+    int oflags = O_WRONLY | O_CREAT;
+#else
+    FILE* f;
+#endif
+    (void)offset;
+    (void)size;
+
+    /* For file-based backend, truncate the file (owner-only, see write).
+     * Truncate only after the permission check so a failed hardening does
+     * not destroy an existing journal. */
+#if !defined(_WIN32)
+    #ifdef O_CLOEXEC
+    oflags |= O_CLOEXEC;
+    #endif
+    #ifdef O_NOFOLLOW
+    oflags |= O_NOFOLLOW;
+    #endif
+    fd = open(path, oflags, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        return TPM_RC_FAILURE;
+    }
+    if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        close(fd);
+        return TPM_RC_FAILURE;
+    }
+    if (ftruncate(fd, 0) != 0) {
+        close(fd);
+        return TPM_RC_FAILURE;
+    }
+    close(fd);
+#else
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        return TPM_RC_FAILURE;
+    }
+    fclose(f);
+#endif
+    return TPM_RC_SUCCESS;
+}
+
+/* Default file-based HAL */
+static FWTPM_NV_HAL fwNvDefaultHal = {
+    FwNvFileRead,
+    FwNvFileWrite,
+    FwNvFileErase,
+    (void*)FWTPM_NV_FILE,
+    FWTPM_NV_MAX_SIZE,
+    NULL, /* get_integrity_key: file backend uses a key file */
+    0,    /* writeAlign: none */
+    0     /* appendOnly: 0 (byte-addressable) */
+};
+
+#endif /* !NO_FILESYSTEM */
+
+/* ========================================================================= */
+/* TLV Marshal Helpers                                                       */
+/* ========================================================================= */
+
+static int FwNvMarshalU16(byte* buf, word32* pos, word32 maxSz, UINT16 val)
+{
+    if (*pos + 2 > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    FwStoreU16LE(buf + *pos, val);
+    *pos += 2;
+    return 0;
+}
+
+static int FwNvMarshalU32(byte* buf, word32* pos, word32 maxSz, UINT32 val)
+{
+    if (*pos + 4 > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    FwStoreU32LE(buf + *pos, val);
+    *pos += 4;
+    return 0;
+}
+
+static int FwNvMarshalBytes(byte* buf, word32* pos, word32 maxSz,
+    const byte* data, word32 len)
+{
+    if (*pos + len > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    if (len > 0) {
+        XMEMCPY(buf + *pos, data, len);
+    }
+    *pos += len;
+    return 0;
+}
+
+static int FwNvMarshalU8(byte* buf, word32* pos, word32 maxSz, UINT8 val)
+{
+    if (*pos + 1 > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    buf[*pos] = val;
+    *pos += 1;
+    return 0;
+}
+
+static int FwNvUnmarshalU8(const byte* buf, word32* pos, word32 maxSz,
+    UINT8* val)
+{
+    if (*pos + 1 > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    *val = buf[*pos];
+    *pos += 1;
+    return 0;
+}
+
+static int FwNvUnmarshalU16(const byte* buf, word32* pos, word32 maxSz,
+    UINT16* val)
+{
+    if (*pos + 2 > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    *val = FwLoadU16LE(buf + *pos);
+    *pos += 2;
+    return 0;
+}
+
+static int FwNvUnmarshalU32(const byte* buf, word32* pos, word32 maxSz,
+    UINT32* val)
+{
+    if (*pos + 4 > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    *val = FwLoadU32LE(buf + *pos);
+    *pos += 4;
+    return 0;
+}
+
+static int FwNvUnmarshalBytes(const byte* buf, word32* pos, word32 maxSz,
+    byte* data, word32 len)
+{
+    if (*pos + len > maxSz) {
+        return TPM_RC_FAILURE;
+    }
+    if (len > 0) {
+        XMEMCPY(data, buf + *pos, len);
+    }
+    *pos += len;
+    return 0;
+}
+
+/* Marshal TPM2B_AUTH: UINT16 size + byte[size] */
+static int FwNvMarshalAuth(byte* buf, word32* pos, word32 maxSz,
+    const TPM2B_AUTH* auth)
+{
+    int rc;
+    UINT16 sz = auth->size;
+    if (sz > sizeof(auth->buffer)) {
+        sz = 0;
+    }
+    rc = FwNvMarshalU16(buf, pos, maxSz, sz);
+    if (rc == 0 && sz > 0) {
+        rc = FwNvMarshalBytes(buf, pos, maxSz, auth->buffer, sz);
+    }
+    return rc;
+}
+
+static int FwNvUnmarshalAuth(const byte* buf, word32* pos, word32 maxSz,
+    TPM2B_AUTH* auth)
+{
+    int rc;
+    rc = FwNvUnmarshalU16(buf, pos, maxSz, &auth->size);
+    if (rc == 0) {
+        if (auth->size > sizeof(auth->buffer)) {
+            auth->size = 0;
+            return TPM_RC_FAILURE;
+        }
+        if (auth->size > 0) {
+            rc = FwNvUnmarshalBytes(buf, pos, maxSz,
+                auth->buffer, auth->size);
+        }
+    }
+    return rc;
+}
+
+/* Marshal TPM2B_DIGEST: same as Auth */
+static int FwNvMarshalDigest(byte* buf, word32* pos, word32 maxSz,
+    const TPM2B_DIGEST* digest)
+{
+    return FwNvMarshalAuth(buf, pos, maxSz, (const TPM2B_AUTH*)digest);
+}
+
+static int FwNvUnmarshalDigest(const byte* buf, word32* pos, word32 maxSz,
+    TPM2B_DIGEST* digest)
+{
+    return FwNvUnmarshalAuth(buf, pos, maxSz, (TPM2B_AUTH*)digest);
+}
+
+/* Marshal TPMT_PUBLIC using TPM2_Packet infrastructure.
+ * Uses TPM2_Packet_AppendPublic which writes a BE size prefix + public area. */
+static int FwNvMarshalPublic(byte* buf, word32* pos, word32 maxSz,
+    TPMT_PUBLIC* pub)
+{
+    TPM2_Packet pkt;
+    TPM2B_PUBLIC pub2b;
+
+    XMEMSET(&pkt, 0, sizeof(pkt));
+    pkt.buf = buf + *pos;
+    pkt.pos = 0;
+    pkt.size = (int)(maxSz - *pos);
+
+    XMEMCPY(&pub2b.publicArea, pub, sizeof(TPMT_PUBLIC));
+    TPM2_Packet_AppendPublic(&pkt, &pub2b);
+
+    if (pkt.pos <= 0 || (word32)pkt.pos > (maxSz - *pos)) {
+        return TPM_RC_FAILURE;
+    }
+    *pos += pkt.pos;
+    return 0;
+}
+
+static int FwNvUnmarshalPublic(const byte* buf, word32* pos, word32 maxSz,
+    TPMT_PUBLIC* pub)
+{
+    TPM2_Packet pkt;
+    TPM2B_PUBLIC pub2b;
+
+    XMEMSET(&pkt, 0, sizeof(pkt));
+    pkt.buf = (byte*)(buf + *pos);
+    pkt.pos = 0;
+    pkt.size = (int)(maxSz - *pos);
+
+    TPM2_Packet_ParsePublic(&pkt, &pub2b);
+
+    if (pkt.pos <= 0 || (word32)pkt.pos > (maxSz - *pos)) {
+        return TPM_RC_FAILURE;
+    }
+    /* authPolicy.size must equal the nameAlg digest size (Part 3 Sec.31.3) */
+    if (pub2b.publicArea.authPolicy.size > 0 &&
+            (int)pub2b.publicArea.authPolicy.size !=
+                TPM2_GetHashDigestSize(pub2b.publicArea.nameAlg)) {
+        return TPM_RC_FAILURE;
+    }
+    XMEMCPY(pub, &pub2b.publicArea, sizeof(TPMT_PUBLIC));
+
+    *pos += pkt.pos;
+    return 0;
+}
+
+/* Marshal TPM2B_NAME: UINT16 size + byte[size] */
+static int FwNvMarshalName(byte* buf, word32* pos, word32 maxSz,
+    const TPM2B_NAME* name)
+{
+    int rc;
+    UINT16 sz = name->size;
+    if (sz > sizeof(name->name)) {
+        sz = 0;
+    }
+    rc = FwNvMarshalU16(buf, pos, maxSz, sz);
+    if (rc == 0 && sz > 0) {
+        rc = FwNvMarshalBytes(buf, pos, maxSz, name->name, sz);
+    }
+    return rc;
+}
+
+static int FwNvUnmarshalName(const byte* buf, word32* pos, word32 maxSz,
+    TPM2B_NAME* name)
+{
+    int rc;
+    rc = FwNvUnmarshalU16(buf, pos, maxSz, &name->size);
+    if (rc == 0) {
+        if (name->size > sizeof(name->name)) {
+            name->size = 0;
+            return TPM_RC_FAILURE;
+        }
+        if (name->size > 0) {
+            rc = FwNvUnmarshalBytes(buf, pos, maxSz,
+                name->name, name->size);
+        }
+    }
+    return rc;
+}
+
+/* Marshal TPMS_NV_PUBLIC manually (no packet function exists) */
+static int FwNvMarshalNvPublic(byte* buf, word32* pos, word32 maxSz,
+    const TPMS_NV_PUBLIC* nvPub)
+{
+    int rc;
+    rc = FwNvMarshalU32(buf, pos, maxSz, nvPub->nvIndex);
+    if (rc == 0) {
+        rc = FwNvMarshalU16(buf, pos, maxSz, nvPub->nameAlg);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalU32(buf, pos, maxSz, nvPub->attributes);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalDigest(buf, pos, maxSz, &nvPub->authPolicy);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalU16(buf, pos, maxSz, nvPub->dataSize);
+    }
+    return rc;
+}
+
+static int FwNvUnmarshalNvPublic(const byte* buf, word32* pos, word32 maxSz,
+    TPMS_NV_PUBLIC* nvPub)
+{
+    int rc;
+    rc = FwNvUnmarshalU32(buf, pos, maxSz, &nvPub->nvIndex);
+    /* nvIndex must be in the NV handle range or a later lookup could be
+     * confused with another handle class (Part 2 Sec.7.4). */
+    if (rc == 0 &&
+            (nvPub->nvIndex < NV_INDEX_FIRST ||
+             nvPub->nvIndex > NV_INDEX_LAST)) {
+        rc = TPM_RC_FAILURE;
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU16(buf, pos, maxSz, &nvPub->nameAlg);
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU32(buf, pos, maxSz, &nvPub->attributes);
+    }
+    /* Reserved TPMA_NV bits [9:8] and [24:20] must be clear (Part 2
+     * Sec.13.4); a crafted journal entry could otherwise install an index
+     * with undefined access-control semantics. */
+    if (rc == 0 && (nvPub->attributes & 0x01F00300UL) != 0) {
+        rc = TPM_RC_FAILURE;
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalDigest(buf, pos, maxSz, &nvPub->authPolicy);
+    }
+    /* Per TPM 2.0 Part 3 Sec.31.3, authPolicy.size must equal the digest
+     * size of nameAlg. A mismatched length installs a policy whose size
+     * never matches any legitimate session policyDigest, permanently
+     * denying policy-based access to this NV index. */
+    if (rc == 0 && nvPub->authPolicy.size > 0 &&
+            (int)nvPub->authPolicy.size !=
+                TPM2_GetHashDigestSize(nvPub->nameAlg)) {
+        rc = TPM_RC_FAILURE;
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU16(buf, pos, maxSz, &nvPub->dataSize);
+    }
+    /* nv->data[] is sized to FWTPM_MAX_NV_DATA; rejecting an inflated
+     * dataSize here prevents the later NV_Write bounds check from
+     * comparing offset+size against an attacker-chosen ceiling and
+     * overrunning the fixed destination buffer. */
+    if (rc == 0 && nvPub->dataSize > FWTPM_MAX_NV_DATA) {
+        rc = TPM_RC_FAILURE;
+    }
+    return rc;
+}
+
+/* ========================================================================= */
+/* Entry-level marshal/unmarshal                                             */
+/* ========================================================================= */
+
+/* Marshal FWTPM_NvIndex → value bytes (variable length) */
+static int FwNvMarshalNvIndex(byte* buf, word32* pos, word32 maxSz,
+    const FWTPM_NvIndex* nv)
+{
+    int rc;
+    UINT16 dataLen;
+
+    /* nvHandle is embedded in nvPublic.nvIndex */
+    rc = FwNvMarshalNvPublic(buf, pos, maxSz, &nv->nvPublic);
+    if (rc == 0) {
+        rc = FwNvMarshalAuth(buf, pos, maxSz, &nv->authValue);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalU8(buf, pos, maxSz, (UINT8)nv->written);
+    }
+    /* Only marshal actual data bytes, not full FWTPM_MAX_NV_DATA */
+    dataLen = nv->nvPublic.dataSize;
+    if (dataLen > FWTPM_MAX_NV_DATA) {
+        dataLen = FWTPM_MAX_NV_DATA;
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalU16(buf, pos, maxSz, dataLen);
+    }
+    if (rc == 0 && dataLen > 0) {
+        rc = FwNvMarshalBytes(buf, pos, maxSz, nv->data, dataLen);
+    }
+    return rc;
+}
+
+static int FwNvUnmarshalNvIndex(const byte* buf, word32* pos, word32 maxSz,
+    FWTPM_NvIndex* nv)
+{
+    int rc;
+    UINT16 dataLen;
+    UINT8 written = 0;
+
+    XMEMSET(nv, 0, sizeof(FWTPM_NvIndex));
+    nv->inUse = 1;
+
+    rc = FwNvUnmarshalNvPublic(buf, pos, maxSz, &nv->nvPublic);
+    if (rc == 0) {
+        rc = FwNvUnmarshalAuth(buf, pos, maxSz, &nv->authValue);
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU8(buf, pos, maxSz, &written);
+        nv->written = (int)written;
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU16(buf, pos, maxSz, &dataLen);
+    }
+    if (rc == 0) {
+        if (dataLen > FWTPM_MAX_NV_DATA) {
+            return TPM_RC_FAILURE;
+        }
+        if (dataLen > 0) {
+            rc = FwNvUnmarshalBytes(buf, pos, maxSz, nv->data, dataLen);
+        }
+    }
+    return rc;
+}
+
+/* Marshal FWTPM_Object → value bytes */
+static int FwNvMarshalObject(byte* buf, word32* pos, word32 maxSz,
+    const FWTPM_Object* obj)
+{
+    int rc;
+    UINT16 privSz;
+
+    rc = FwNvMarshalU32(buf, pos, maxSz, obj->handle);
+    if (rc == 0) {
+        rc = FwNvMarshalPublic(buf, pos, maxSz, (TPMT_PUBLIC*)&obj->pub);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalAuth(buf, pos, maxSz, &obj->authValue);
+    }
+    /* Only marshal actual private key bytes */
+    privSz = (UINT16)obj->privKeySize;
+    if (privSz > FWTPM_MAX_PRIVKEY_DER) {
+        privSz = 0;
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalU16(buf, pos, maxSz, privSz);
+    }
+    if (rc == 0 && privSz > 0) {
+        rc = FwNvMarshalBytes(buf, pos, maxSz, obj->privKey, privSz);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalName(buf, pos, maxSz, &obj->name);
+    }
+    /* Hierarchy trails the historic layout so a pre-existing journal (which
+     * lacks it) still unmarshals; access control needs it to enforce a
+     * disabled hierarchy against reloaded persistent objects. */
+    if (rc == 0) {
+        rc = FwNvMarshalU32(buf, pos, maxSz, obj->hierarchy);
+    }
+    return rc;
+}
+
+static int FwNvUnmarshalObject(const byte* buf, word32* pos, word32 maxSz,
+    FWTPM_Object* obj)
+{
+    int rc;
+    UINT16 privSz;
+
+    XMEMSET(obj, 0, sizeof(FWTPM_Object));
+
+    rc = FwNvUnmarshalU32(buf, pos, maxSz, &obj->handle);
+    /* A persistent object handle must stay in range or a later FwFindObject
+     * lookup could resolve a transient handle to this slot. */
+    if (rc == 0 &&
+            (obj->handle < PERSISTENT_FIRST || obj->handle > PERSISTENT_LAST)) {
+        rc = TPM_RC_VALUE;
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalPublic(buf, pos, maxSz, &obj->pub);
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalAuth(buf, pos, maxSz, &obj->authValue);
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU16(buf, pos, maxSz, &privSz);
+    }
+    if (rc == 0) {
+        if (privSz > FWTPM_MAX_PRIVKEY_DER) {
+            rc = TPM_RC_FAILURE;
+        }
+    }
+    if (rc == 0) {
+        obj->privKeySize = (int)privSz;
+        if (privSz > 0) {
+            rc = FwNvUnmarshalBytes(buf, pos, maxSz, obj->privKey, privSz);
+        }
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalName(buf, pos, maxSz, &obj->name);
+    }
+    /* Optional trailing hierarchy. A pre-existing journal lacks it: a
+     * platform-range record is unambiguously platform, but an owner-range
+     * record's owner-vs-endorsement provenance is unknown, so it is left 0
+     * and the access-control gate enforces both storage and endorsement
+     * disables conservatively for it. */
+    if (rc == 0 && *pos + 4 <= maxSz) {
+        rc = FwNvUnmarshalU32(buf, pos, maxSz, &obj->hierarchy);
+    }
+    else if (rc == 0 && obj->handle >= PLATFORM_PERSISTENT) {
+        obj->hierarchy = TPM_RH_PLATFORM;
+    }
+    if (rc == 0) {
+        obj->used = 1;
+    }
+    return rc;
+}
+
+/* Marshal FWTPM_PrimaryCache → value bytes */
+static int FwNvMarshalPrimaryCache(byte* buf, word32* pos, word32 maxSz,
+    const FWTPM_PrimaryCache* cache)
+{
+    int rc;
+    UINT16 privSz;
+
+    rc = FwNvMarshalU32(buf, pos, maxSz, cache->hierarchy);
+    if (rc == 0) {
+        rc = FwNvMarshalBytes(buf, pos, maxSz, cache->templateHash,
+            WC_SHA256_DIGEST_SIZE);
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalPublic(buf, pos, maxSz, (TPMT_PUBLIC*)&cache->pub);
+    }
+    privSz = (UINT16)cache->privKeySize;
+    if (privSz > FWTPM_MAX_PRIVKEY_DER) {
+        privSz = 0;
+    }
+    if (rc == 0) {
+        rc = FwNvMarshalU16(buf, pos, maxSz, privSz);
+    }
+    if (rc == 0 && privSz > 0) {
+        rc = FwNvMarshalBytes(buf, pos, maxSz, cache->privKey, privSz);
+    }
+    return rc;
+}
+
+static int FwNvUnmarshalPrimaryCache(const byte* buf, word32* pos,
+    word32 maxSz, FWTPM_PrimaryCache* cache)
+{
+    int rc;
+    UINT16 privSz;
+
+    XMEMSET(cache, 0, sizeof(FWTPM_PrimaryCache));
+
+    rc = FwNvUnmarshalU32(buf, pos, maxSz, &cache->hierarchy);
+    if (rc == 0) {
+        rc = FwNvUnmarshalBytes(buf, pos, maxSz, cache->templateHash,
+            WC_SHA256_DIGEST_SIZE);
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalPublic(buf, pos, maxSz, &cache->pub);
+    }
+    if (rc == 0) {
+        rc = FwNvUnmarshalU16(buf, pos, maxSz, &privSz);
+    }
+    if (rc == 0) {
+        if (privSz > FWTPM_MAX_PRIVKEY_DER) {
+            rc = TPM_RC_FAILURE;
+        }
+    }
+    if (rc == 0) {
+        cache->privKeySize = (int)privSz;
+        if (privSz > 0) {
+            rc = FwNvUnmarshalBytes(buf, pos, maxSz, cache->privKey, privSz);
+        }
+    }
+    if (rc == 0) {
+        cache->used = 1;
+    }
+    return rc;
+}
+
+/* ========================================================================= */
+/* Journal Integrity                                                         */
+/* ========================================================================= */
+
+#if !defined(NO_FILESYSTEM)
+/* Load, or create on first use, the sibling key file for the default file
+ * backend so journal integrity is enabled without integrator action. */
+static int FwNvLoadOrCreateKeyFile(FWTPM_CTX* ctx, byte* key, word32* keySz)
+{
+    const char* nvPath = (const char*)ctx->nvHal.ctx;
+    char keyPath[256];
+    size_t nvLen;
+    int ok = 0;
+#if !defined(_WIN32)
+    int kfd;
+    int rfd;
+    int kflags = O_CREAT | O_EXCL | O_WRONLY;
+    int rflags = O_RDONLY;
+    struct stat kst;
+#else
+    FILE* f;
+#endif
+
+    if (nvPath == NULL) {
+        return 0;
+    }
+    nvLen = XSTRLEN(nvPath);
+    if (nvLen + 5 > sizeof(keyPath)) { /* ".key" + NUL */
+        return 0;
+    }
+    XMEMCPY(keyPath, nvPath, nvLen);
+    XMEMCPY(keyPath + nvLen, ".key", 5);
+
+#if !defined(_WIN32)
+    /* O_NOFOLLOW blocks a symlink swap to an attacker-chosen target on both
+     * the read and create paths. */
+    #ifdef O_NOFOLLOW
+    rflags |= O_NOFOLLOW;
+    #endif
+    rfd = open(keyPath, rflags);
+    if (rfd >= 0) {
+        /* Only trust a regular file we own with no group/other access */
+        if (fstat(rfd, &kst) == 0 && S_ISREG(kst.st_mode) &&
+                kst.st_uid == geteuid() &&
+                (kst.st_mode & (S_IRWXG | S_IRWXO)) == 0) {
+            ok = (read(rfd, key, FWTPM_NV_KEY_SIZE) ==
+                (ssize_t)FWTPM_NV_KEY_SIZE);
+        }
+        close(rfd);
+    }
+    else {
+        if (wc_RNG_GenerateBlock(&ctx->rng, key, FWTPM_NV_KEY_SIZE) != 0) {
+            return 0;
+        }
+        /* O_EXCL prevents a pre-creation race */
+        #ifdef O_NOFOLLOW
+        kflags |= O_NOFOLLOW;
+        #endif
+        kfd = open(keyPath, kflags, S_IRUSR | S_IWUSR);
+        if (kfd >= 0) {
+            ok = (write(kfd, key, FWTPM_NV_KEY_SIZE) ==
+                (ssize_t)FWTPM_NV_KEY_SIZE);
+            close(kfd);
+        }
+    }
+#else
+    f = fopen(keyPath, "rb");
+    if (f != NULL) {
+        ok = ((int)fread(key, 1, FWTPM_NV_KEY_SIZE, f) == FWTPM_NV_KEY_SIZE);
+        fclose(f);
+    }
+    else {
+        if (wc_RNG_GenerateBlock(&ctx->rng, key, FWTPM_NV_KEY_SIZE) != 0) {
+            return 0;
+        }
+        f = fopen(keyPath, "wb");
+        if (f != NULL) {
+            ok = ((int)fwrite(key, 1, FWTPM_NV_KEY_SIZE, f)
+                == FWTPM_NV_KEY_SIZE);
+            fclose(f);
+        }
+    }
+#endif
+
+    if (ok) {
+        *keySz = FWTPM_NV_KEY_SIZE;
+        return 1;
+    }
+    TPM2_ForceZero(key, FWTPM_NV_KEY_SIZE);
+    return 0;
+}
+#endif /* !NO_FILESYSTEM */
+
+/* Resolve the journal integrity key: a platform-provided device secret if
+ * the HAL supplies one, else the default file backend's key file. */
+static int FwNvGetIntegrityKey(FWTPM_CTX* ctx, byte* key, word32* keySz)
+{
+    *keySz = 0;
+    if (ctx->nvHal.get_integrity_key != NULL) {
+        if (ctx->nvHal.get_integrity_key(ctx->nvHal.ctx, key, keySz) == 0 &&
+                *keySz > 0) {
+            return 1;
+        }
+        return 0;
+    }
+#if !defined(NO_FILESYSTEM)
+    if (ctx->nvHal.read == FwNvFileRead) {
+        return FwNvLoadOrCreateKeyFile(ctx, key, keySz);
+    }
+#endif
+    return 0;
+}
+
+/* Write via the HAL. Byte-addressable backends pass through. In append-only
+ * mode (writeAlign > 1) writes are forward into erased space; bytes accumulate
+ * in a pending program granule, flushed once full so a cell is never rewritten
+ * and hal->write is a plain program. A new granule must start aligned. */
+static int FwNvHalWrite(FWTPM_CTX* ctx, word32 offset, const byte* buf,
+    word32 size)
+{
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+
+    if (hal->write == NULL) {
+        return TPM_RC_FAILURE;
+    }
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    if (FW_NV_APPEND_ONLY(hal) && hal->writeAlign > 1) {
+        word32 align = hal->writeAlign;
+        word32 src = 0;
+        word32 n;
+        int rc;
+
+        if (size == 0) {
+            return TPM_RC_SUCCESS;
+        }
+        if (size > hal->maxSize || offset > hal->maxSize - size) {
+            return TPM_RC_FAILURE;
+        }
+        if (ctx->nvGranuleFill == 0 ||
+                offset != ctx->nvGranuleBase + ctx->nvGranuleFill) {
+            if (ctx->nvGranuleFill != 0 || (offset % align) != 0) {
+                return TPM_RC_FAILURE; /* must start a granule aligned */
+            }
+            ctx->nvGranuleBase = offset;
+        }
+        while (src < size) {
+            n = align - ctx->nvGranuleFill;
+            if (n > size - src) {
+                n = size - src;
+            }
+            XMEMCPY((byte*)ctx->nvGranule + ctx->nvGranuleFill, buf + src, n);
+            ctx->nvGranuleFill += n;
+            src += n;
+            if (ctx->nvGranuleFill == align) {
+                rc = hal->write(hal->ctx, ctx->nvGranuleBase,
+                    (const byte*)ctx->nvGranule, align);
+                if (rc != 0) {
+                    return TPM_RC_FAILURE;
+                }
+                ctx->nvGranuleBase += align;
+                ctx->nvGranuleFill = 0;
+            }
+        }
+        return TPM_RC_SUCCESS;
+    }
+#endif
+    return hal->write(hal->ctx, offset, buf, size);
+}
+
+/* Read via the HAL, overlaying the pending program granule (append-only) so a
+ * freshly appended entry reads back before it is flushed (e.g. for the MAC). */
+static int FwNvHalRead(FWTPM_CTX* ctx, word32 offset, byte* buf, word32 size)
+{
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+    int rc;
+
+    if (hal->read == NULL) {
+        return TPM_RC_FAILURE;
+    }
+    rc = hal->read(hal->ctx, offset, buf, size);
+    if (rc != 0) {
+        return TPM_RC_FAILURE;
+    }
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    if (FW_NV_APPEND_ONLY(hal) && hal->writeAlign > 1 &&
+            ctx->nvGranuleFill > 0 && size > 0) {
+        word32 pStart = ctx->nvGranuleBase;
+        word32 pEnd = ctx->nvGranuleBase + ctx->nvGranuleFill;
+        word32 a = (offset > pStart) ? offset : pStart;
+        word32 b = ((offset + size) < pEnd) ? (offset + size) : pEnd;
+        if (a < b) {
+            XMEMCPY(buf + (a - offset),
+                (const byte*)ctx->nvGranule + (a - pStart), b - a);
+        }
+    }
+#endif
+    return TPM_RC_SUCCESS;
+}
+
+/* HMAC-SHA256 over the journal body [header .. writePos). */
+static int FwNvComputeJournalMac(FWTPM_CTX* ctx, const byte* key,
+    word32 keySz, byte* macOut)
+{
+    FWTPM_DECLARE_VAR(hmac, Hmac);
+    byte chunk[256];
+    word32 off = sizeof(FWTPM_NV_HEADER);
+    int rc;
+
+    FWTPM_ALLOC_VAR(hmac, Hmac);
+
+    rc = wc_HmacInit(hmac, NULL, INVALID_DEVID);
+    if (rc == 0) {
+        rc = wc_HmacSetKey(hmac, WC_SHA256, key, keySz);
+    }
+    while (rc == 0 && off < ctx->nvWritePos) {
+        word32 n = ctx->nvWritePos - off;
+        if (n > sizeof(chunk)) {
+            n = sizeof(chunk);
+        }
+        rc = FwNvHalRead(ctx, off, chunk, n);
+        if (rc == 0) {
+            rc = wc_HmacUpdate(hmac, chunk, n);
+        }
+        off += n;
+    }
+    if (rc == 0) {
+        rc = wc_HmacFinal(hmac, macOut);
+    }
+    wc_HmacFree(hmac);
+    FWTPM_FREE_VAR(hmac);
+    return rc;
+}
+
+/* ========================================================================= */
+/* Journal Operations                                                        */
+/* ========================================================================= */
+
+/* Write NV header at offset 0 */
+static int FwNvWriteHeader(FWTPM_CTX* ctx)
+{
+    byte hdr[sizeof(FWTPM_NV_HEADER)]; /* 4 x UINT32 = 16 bytes */
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+
+    byte key[FWTPM_NV_KEY_SIZE];
+    byte mac[FWTPM_NV_MAC_SIZE];
+    word32 keySz = 0;
+    int rc;
+
+    FwStoreU32LE(hdr + 0,  FWTPM_NV_MAGIC);
+    FwStoreU32LE(hdr + 4,  FWTPM_NV_VERSION);
+    FwStoreU32LE(hdr + 8,  ctx->nvWritePos);
+    FwStoreU32LE(hdr + 12, hal->maxSize);
+
+    rc = FwNvHalWrite(ctx, 0, hdr, sizeof(hdr));
+
+    /* Rewrite the trailing MAC in place (byte-addressable only; append-only
+     * commits integrity via FwNvAppendCheckpoint instead). */
+    if (rc == TPM_RC_SUCCESS && !FW_NV_APPEND_ONLY(hal) &&
+            FwNvGetIntegrityKey(ctx, key, &keySz)) {
+        rc = FwNvComputeJournalMac(ctx, key, keySz, mac);
+        if (rc == TPM_RC_SUCCESS) {
+            rc = FwNvHalWrite(ctx, ctx->nvWritePos, mac, sizeof(mac));
+        }
+        TPM2_ForceZero(key, sizeof(key));
+    }
+    return rc;
+}
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+/* Append-only commit: append a MAC-checkpoint entry over the body so far, with
+ * 0xFF pad in its value to round writePos up to writeAlign (the next commit
+ * then starts on a fresh program granule; the loader skips it on replay). */
+static int FwNvAppendCheckpoint(FWTPM_CTX* ctx)
+{
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+    byte key[FWTPM_NV_KEY_SIZE];
+    byte mac[FWTPM_NV_MAC_SIZE];
+    byte tlvHdr[TLV_HDR_SIZE];
+    byte ff[64];
+    word32 keySz = 0;
+    word32 macLen = 0;
+    word32 align;
+    word32 padLen;
+    word32 valueLen;
+    word32 padDone;
+    word32 padChunk;
+    int haveKey;
+    int rc = TPM_RC_SUCCESS;
+
+    if (hal->write == NULL) {
+        return TPM_RC_FAILURE;
+    }
+
+    /* MAC over [header .. current writePos) (this entry not included). */
+    haveKey = FwNvGetIntegrityKey(ctx, key, &keySz);
+    if (haveKey) {
+        rc = FwNvComputeJournalMac(ctx, key, keySz, mac);
+        TPM2_ForceZero(key, sizeof(key));
+        if (rc != TPM_RC_SUCCESS) {
+            return rc;
+        }
+        macLen = FWTPM_NV_MAC_SIZE;
+    }
+
+    /* Pad so writePos lands on a writeAlign boundary after this entry. */
+    align = hal->writeAlign;
+    if (align < 1) {
+        align = 1;
+    }
+    padLen = (align - ((ctx->nvWritePos + TLV_HDR_SIZE + macLen) % align))
+        % align;
+    valueLen = macLen + padLen;
+    if (valueLen > 0xFFFF) {
+        return TPM_RC_FAILURE; /* writeAlign too large for a TLV length */
+    }
+
+    FwStoreU16LE(tlvHdr, FWTPM_NV_TAG_MAC);
+    FwStoreU16LE(tlvHdr + 2, (UINT16)valueLen);
+    rc = FwNvHalWrite(ctx, ctx->nvWritePos, tlvHdr, TLV_HDR_SIZE);
+    if (rc == TPM_RC_SUCCESS && macLen > 0) {
+        rc = FwNvHalWrite(ctx, ctx->nvWritePos + TLV_HDR_SIZE, mac, macLen);
+    }
+    /* Write 0xFF alignment pad (0xFF leaves write-once cells erased). */
+    XMEMSET(ff, 0xFF, sizeof(ff));
+    padDone = 0;
+    while (rc == TPM_RC_SUCCESS && padDone < padLen) {
+        padChunk = padLen - padDone;
+        if (padChunk > sizeof(ff)) {
+            padChunk = sizeof(ff);
+        }
+        rc = FwNvHalWrite(ctx,
+            ctx->nvWritePos + TLV_HDR_SIZE + macLen + padDone, ff, padChunk);
+        padDone += padChunk;
+    }
+    if (rc == TPM_RC_SUCCESS) {
+        ctx->nvWritePos += TLV_HDR_SIZE + valueLen;
+    }
+    return rc;
+}
+#endif /* WOLFTPM_FWTPM_NV_APPEND_ONLY */
+
+/* A deletion cannot be captured by compaction of the live context (which
+ * still holds the item), so these tombstone tags must not be treated as
+ * committed-by-compaction. */
+static int FwNvTagIsDelete(UINT16 tag)
+{
+    return tag == FWTPM_NV_TAG_NV_INDEX_DEL ||
+           tag == FWTPM_NV_TAG_PERSISTENT_DEL ||
+           tag == FWTPM_NV_TAG_PRIMARY_CACHE_DEL;
+}
+
+/* Append a single TLV entry to the journal */
+static int FwNvAppendEntry(FWTPM_CTX* ctx, UINT16 tag,
+    const byte* value, UINT16 valueLen)
+{
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+    word32 entrySize = TLV_HDR_SIZE + valueLen;
+    word32 reserve = FWTPM_NV_MAC_SIZE;
+    byte tlvHdr[TLV_HDR_SIZE];
+    word32 savedWritePos;
+    int rc;
+
+    if (hal->write == NULL) {
+#ifdef FWTPM_NO_NV
+        /* Volatile-only build: there is no backing store, so a state change
+         * succeeds without being persisted rather than reporting a failure. */
+        return TPM_RC_SUCCESS;
+#else
+        return TPM_RC_FAILURE;
+#endif
+    }
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    /* A rejected append left an unsealed entry on the log that the next
+     * checkpoint would authenticate. Rewriting the single region now would
+     * erase the last committed image while the medium may still be failing,
+     * so refuse further mutations; the loader compacts the tail on restart. */
+    if (FW_NV_APPEND_ONLY(hal) && ctx->nvRebuild && !ctx->nvCompacting) {
+        return TPM_RC_NV_UNAVAILABLE;
+    }
+#endif
+
+    /* Append-only also appends a checkpoint and rounds up to a granule. */
+    if (FW_NV_APPEND_ONLY(hal)) {
+        reserve = TLV_HDR_SIZE + FWTPM_NV_MAC_SIZE + hal->writeAlign;
+    }
+
+    /* Reserve room for the trailing journal MAC written after each append */
+    if (ctx->nvWritePos + entrySize + reserve > hal->maxSize) {
+        /* If already compacting, NV is genuinely full */
+        if (ctx->nvCompacting) {
+            return TPM_RC_NV_SPACE;
+        }
+        /* Compact. The rewrite from the live context is the commit for a
+         * non-delete change, and for a deletion whose target the rewrite
+         * omitted; appending a redundant record afterwards would only put the
+         * compacted journal's seal at risk. */
+        rc = FWTPM_NV_Save(ctx);
+        if (rc != TPM_RC_SUCCESS) {
+            return rc;
+        }
+        if (!FwNvTagIsDelete(tag) || ctx->nvDeleteHandle != 0) {
+            return TPM_RC_SUCCESS;
+        }
+        if (ctx->nvWritePos + entrySize + reserve > hal->maxSize) {
+            return TPM_RC_NV_SPACE;
+        }
+    }
+
+    /* Write TLV header */
+    FwStoreU16LE(tlvHdr, tag);
+    FwStoreU16LE(tlvHdr + 2, valueLen);
+
+    savedWritePos = ctx->nvWritePos;
+    rc = FwNvHalWrite(ctx, ctx->nvWritePos, tlvHdr, TLV_HDR_SIZE);
+    if (rc == TPM_RC_SUCCESS && valueLen > 0) {
+        rc = FwNvHalWrite(ctx, ctx->nvWritePos + TLV_HDR_SIZE,
+            value, valueLen);
+    }
+    if (rc == TPM_RC_SUCCESS) {
+        ctx->nvWritePos += entrySize;
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+        /* Commit via a checkpoint; compaction emits one at the end instead. An
+         * entry whose checkpoint fails is not durable, yet it stays on the log
+         * where the next checkpoint would seal it: no more appends until the
+         * loader has compacted it away. */
+        if (FW_NV_APPEND_ONLY(hal)) {
+            if (!ctx->nvCompacting) {
+                rc = FwNvAppendCheckpoint(ctx);
+                if (rc != TPM_RC_SUCCESS) {
+                    ctx->nvRebuild = 1;
+                }
+            }
+        }
+        else
+#endif
+        {
+            rc = FwNvWriteHeader(ctx); /* byte-addressable: header + MAC */
+        }
+    }
+    if (rc != TPM_RC_SUCCESS) {
+        /* A failed append must leave no committable remnant. On a byte-
+         * addressable backend roll the write cursor back so the partial entry
+         * is overwritten by the next append and never sealed into the journal
+         * by a later header write. Append-only flash cannot overwrite, so its
+         * cursor and granule state are left intact for recovery at the next
+         * compaction. */
+        if (!FW_NV_APPEND_ONLY(hal)) {
+            ctx->nvWritePos = savedWritePos;
+        }
+    }
+    return rc;
+}
+
+/* ========================================================================= */
+/* Journal Load (Init)                                                       */
+/* ========================================================================= */
+
+/* Find NV index slot by handle, or allocate empty slot */
+static int FwNvFindOrAllocNvSlot(FWTPM_CTX* ctx, UINT32 nvHandle)
+{
+    int i;
+    int freeSlot = -1;
+
+    for (i = 0; i < FWTPM_MAX_NV_INDICES; i++) {
+        if (ctx->nvIndices[i].inUse &&
+            ctx->nvIndices[i].nvPublic.nvIndex == nvHandle) {
+            return i;
+        }
+        if (!ctx->nvIndices[i].inUse && freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    return freeSlot;
+}
+
+/* Find persistent object slot by handle, or allocate empty slot */
+static int FwNvFindOrAllocPersSlot(FWTPM_CTX* ctx, UINT32 handle)
+{
+    int i;
+    int freeSlot = -1;
+
+    for (i = 0; i < FWTPM_MAX_PERSISTENT; i++) {
+        if (ctx->persistent[i].used &&
+            ctx->persistent[i].handle == handle) {
+            return i;
+        }
+        if (!ctx->persistent[i].used && freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    return freeSlot;
+}
+
+/* Find primary cache slot by hierarchy + templateHash, or allocate */
+static int FwNvFindOrAllocCacheSlot(FWTPM_CTX* ctx, UINT32 hierarchy,
+    const byte* templateHash)
+{
+    int i;
+    int freeSlot = -1;
+
+    for (i = 0; i < FWTPM_MAX_PRIMARY_CACHE; i++) {
+        if (ctx->primaryCache[i].used &&
+            ctx->primaryCache[i].hierarchy == hierarchy &&
+            XMEMCMP(ctx->primaryCache[i].templateHash, templateHash,
+                WC_SHA256_DIGEST_SIZE) == 0) {
+            return i;
+        }
+        if (!ctx->primaryCache[i].used && freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    return freeSlot;
+}
+
+/* Process a single TLV entry during journal scan */
+static int FwNvProcessEntry(FWTPM_CTX* ctx, UINT16 tag,
+    const byte* value, UINT16 valueLen)
+{
+    word32 vPos = 0;
+    word32 vMax = (word32)valueLen;
+
+    switch (tag) {
+        case FWTPM_NV_TAG_OWNER_SEED:
+            if (valueLen >= FWTPM_SEED_SIZE) {
+                XMEMCPY(ctx->ownerSeed, value, FWTPM_SEED_SIZE);
+            }
+            break;
+
+        case FWTPM_NV_TAG_ENDORSEMENT_SEED:
+            if (valueLen >= FWTPM_SEED_SIZE) {
+                XMEMCPY(ctx->endorsementSeed, value, FWTPM_SEED_SIZE);
+            }
+            break;
+
+        case FWTPM_NV_TAG_PLATFORM_SEED:
+            if (valueLen >= FWTPM_SEED_SIZE) {
+                XMEMCPY(ctx->platformSeed, value, FWTPM_SEED_SIZE);
+            }
+            break;
+
+        case FWTPM_NV_TAG_OWNER_AUTH:
+            FwNvUnmarshalAuth(value, &vPos, vMax, &ctx->ownerAuth);
+            break;
+
+        case FWTPM_NV_TAG_ENDORSEMENT_AUTH:
+            FwNvUnmarshalAuth(value, &vPos, vMax, &ctx->endorsementAuth);
+            break;
+
+        case FWTPM_NV_TAG_PLATFORM_AUTH:
+            FwNvUnmarshalAuth(value, &vPos, vMax, &ctx->platformAuth);
+            break;
+
+        case FWTPM_NV_TAG_LOCKOUT_AUTH:
+            FwNvUnmarshalAuth(value, &vPos, vMax, &ctx->lockoutAuth);
+            break;
+
+        case FWTPM_NV_TAG_PCR_STATE:
+            if (valueLen >= (word32)sizeof(ctx->pcrDigest) + 4) {
+                XMEMCPY(ctx->pcrDigest, value, sizeof(ctx->pcrDigest));
+                vPos = (word32)sizeof(ctx->pcrDigest);
+                FwNvUnmarshalU32(value, &vPos, vMax,
+                    &ctx->pcrUpdateCounter);
+            }
+            break;
+
+        case FWTPM_NV_TAG_PCR_AUTH: {
+            int idx;
+            UINT8 allocBanks = FWTPM_PCR_ALLOC_DEFAULT;
+            FwNvUnmarshalU8(value, &vPos, vMax, &allocBanks);
+            ctx->pcrAllocatedBanks = allocBanks;
+            for (idx = 0; idx < IMPLEMENTATION_PCR && vPos < vMax; idx++) {
+                FwNvUnmarshalAuth(value, &vPos, vMax, &ctx->pcrAuth[idx]);
+                FwNvUnmarshalDigest(value, &vPos, vMax,
+                    &ctx->pcrPolicy[idx]);
+                FwNvUnmarshalU16(value, &vPos, vMax,
+                    &ctx->pcrPolicyAlg[idx]);
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_FLAGS: {
+            UINT8 flags8 = 0;
+            FwNvUnmarshalU8(value, &vPos, vMax, &flags8);
+            ctx->disableClear = (flags8 & 0x01) ? 1 : 0;
+            ctx->globalNvWriteLock = (flags8 & 0x02) ? 1 : 0;
+            /* Inverted bits: a pre-existing journal (clear) leaves every
+             * hierarchy enabled. */
+            ctx->shDisabled = (flags8 & 0x10) ? 1 : 0;
+            ctx->ehDisabled = (flags8 & 0x20) ? 1 : 0;
+            ctx->phDisabled = (flags8 & 0x40) ? 1 : 0;
+            ctx->phNvDisabled = (flags8 & 0x80) ? 1 : 0;
+        #ifndef FWTPM_NO_DA
+            FwNvUnmarshalU32(value, &vPos, vMax, &ctx->daMaxTries);
+            FwNvUnmarshalU32(value, &vPos, vMax, &ctx->daRecoveryTime);
+            FwNvUnmarshalU32(value, &vPos, vMax, &ctx->daLockoutRecovery);
+            /* A tampered journal must not disable lockout with 0 or a value
+             * so large the gate never engages */
+            if (ctx->daMaxTries == 0 ||
+                    ctx->daMaxTries > FWTPM_DA_MAX_TRIES_LIMIT) {
+                ctx->daMaxTries = FWTPM_DA_DEFAULT_MAX_TRIES;
+            }
+            ctx->daUsed = 0; /* per-boot, reset on load */
+        #endif
+            /* resetCount trails the DA fields in newer journals */
+            if (vPos + 4 <= vMax) {
+                FwNvUnmarshalU32(value, &vPos, vMax, &ctx->resetCount);
+            }
+        #ifndef FWTPM_NO_DA
+            /* daFailedTries trails resetCount in journals that record it.
+             * Older journals lack it: treat as a clean orderly checkpoint so
+             * an upgrade does not trigger a spurious lockout penalty. */
+            if (vPos + 4 <= vMax) {
+                FwNvUnmarshalU32(value, &vPos, vMax, &ctx->daFailedTries);
+                if (ctx->daFailedTries > FWTPM_DA_MAX_TRIES_LIMIT) {
+                    ctx->daFailedTries = ctx->daMaxTries;
+                }
+                ctx->orderly = (flags8 & 0x04) ? 1 : 0;
+                ctx->lockoutAuthFailed = (flags8 & 0x08) ? 1 : 0;
+            }
+            else {
+                ctx->daFailedTries = 0;
+                ctx->orderly = 1;
+                ctx->lockoutAuthFailed = 0;
+            }
+        #endif
+            break;
+        }
+
+        case FWTPM_NV_TAG_CLOCK: {
+            UINT32 lo = 0, hi = 0;
+            FwNvUnmarshalU32(value, &vPos, vMax, &lo);
+            FwNvUnmarshalU32(value, &vPos, vMax, &hi);
+            ctx->clockOffset = (UINT64)lo | ((UINT64)hi << 32);
+            break;
+        }
+
+        case FWTPM_NV_TAG_HIERARCHY_POLICY: {
+            UINT32 hier = 0;
+            UINT16 alg = 0;
+            TPM2B_DIGEST policy;
+            XMEMSET(&policy, 0, sizeof(policy));
+            FwNvUnmarshalU32(value, &vPos, vMax, &hier);
+            FwNvUnmarshalU16(value, &vPos, vMax, &alg);
+            FwNvUnmarshalDigest(value, &vPos, vMax, &policy);
+            /* Per TPM 2.0 Part 3 Sec.23.1, policy.size must equal the
+             * digest size of alg. Discard a journal entry where the
+             * sizes diverge so it cannot lock the hierarchy out by
+             * forcing every legitimate policy session to fail the
+             * size check at policyDigest enforcement time. */
+            if (policy.size > 0 &&
+                    (int)policy.size != TPM2_GetHashDigestSize(alg)) {
+                XMEMSET(&policy, 0, sizeof(policy));
+                break;
+            }
+            switch (hier) {
+                case TPM_RH_OWNER:
+                    XMEMCPY(&ctx->ownerPolicy, &policy,
+                        sizeof(TPM2B_DIGEST));
+                    ctx->ownerPolicyAlg = alg;
+                    break;
+                case TPM_RH_ENDORSEMENT:
+                    XMEMCPY(&ctx->endorsementPolicy, &policy,
+                        sizeof(TPM2B_DIGEST));
+                    ctx->endorsementPolicyAlg = alg;
+                    break;
+                case TPM_RH_PLATFORM:
+                    XMEMCPY(&ctx->platformPolicy, &policy,
+                        sizeof(TPM2B_DIGEST));
+                    ctx->platformPolicyAlg = alg;
+                    break;
+                case TPM_RH_LOCKOUT:
+                    XMEMCPY(&ctx->lockoutPolicy, &policy,
+                        sizeof(TPM2B_DIGEST));
+                    ctx->lockoutPolicyAlg = alg;
+                    break;
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_NV_INDEX: {
+            FWTPM_NvIndex nv;
+            int slot;
+            if (FwNvUnmarshalNvIndex(value, &vPos, vMax, &nv) == 0) {
+                slot = FwNvFindOrAllocNvSlot(ctx, nv.nvPublic.nvIndex);
+                if (slot >= 0) {
+                    XMEMCPY(&ctx->nvIndices[slot], &nv,
+                        sizeof(FWTPM_NvIndex));
+                }
+                else {
+                    WOLFSSL_MSG("fwTPM NV: no free NV slot, entry dropped");
+                }
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_NV_INDEX_DEL: {
+            UINT32 nvHandle = 0;
+            int i;
+            FwNvUnmarshalU32(value, &vPos, vMax, &nvHandle);
+            for (i = 0; i < FWTPM_MAX_NV_INDICES; i++) {
+                if (ctx->nvIndices[i].inUse &&
+                    ctx->nvIndices[i].nvPublic.nvIndex == nvHandle) {
+                    XMEMSET(&ctx->nvIndices[i], 0, sizeof(FWTPM_NvIndex));
+                    break;
+                }
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_PERSISTENT: {
+            FWTPM_Object obj;
+            int slot;
+            if (FwNvUnmarshalObject(value, &vPos, vMax, &obj) == 0) {
+                slot = FwNvFindOrAllocPersSlot(ctx, obj.handle);
+                if (slot >= 0) {
+                    XMEMCPY(&ctx->persistent[slot], &obj,
+                        sizeof(FWTPM_Object));
+                }
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_PERSISTENT_DEL: {
+            UINT32 handle = 0;
+            int i;
+            FwNvUnmarshalU32(value, &vPos, vMax, &handle);
+            if (handle >= PERSISTENT_FIRST && handle <= PERSISTENT_LAST) {
+                for (i = 0; i < FWTPM_MAX_PERSISTENT; i++) {
+                    if (ctx->persistent[i].used &&
+                        ctx->persistent[i].handle == handle) {
+                        XMEMSET(&ctx->persistent[i], 0, sizeof(FWTPM_Object));
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_PRIMARY_CACHE: {
+            FWTPM_PrimaryCache cache;
+            int slot;
+            if (FwNvUnmarshalPrimaryCache(value, &vPos, vMax, &cache) == 0) {
+                slot = FwNvFindOrAllocCacheSlot(ctx, cache.hierarchy,
+                    cache.templateHash);
+                if (slot >= 0) {
+                    XMEMCPY(&ctx->primaryCache[slot], &cache,
+                        sizeof(FWTPM_PrimaryCache));
+                }
+            }
+            break;
+        }
+
+        case FWTPM_NV_TAG_PRIMARY_CACHE_DEL: {
+            UINT32 hierarchy = 0;
+            byte tmplHash[WC_SHA256_DIGEST_SIZE];
+            int i;
+            FwNvUnmarshalU32(value, &vPos, vMax, &hierarchy);
+            if (vPos + WC_SHA256_DIGEST_SIZE <= vMax) {
+                FwNvUnmarshalBytes(value, &vPos, vMax, tmplHash,
+                    WC_SHA256_DIGEST_SIZE);
+                for (i = 0; i < FWTPM_MAX_PRIMARY_CACHE; i++) {
+                    if (ctx->primaryCache[i].used &&
+                        ctx->primaryCache[i].hierarchy == hierarchy &&
+                        XMEMCMP(ctx->primaryCache[i].templateHash, tmplHash,
+                            WC_SHA256_DIGEST_SIZE) == 0) {
+                        XMEMSET(&ctx->primaryCache[i], 0,
+                            sizeof(FWTPM_PrimaryCache));
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+
+        default:
+            /* Unknown tag - skip */
+            break;
+    }
+
+    return 0;
+}
+
+/* ========================================================================= */
+/* Public API                                                                */
+/* ========================================================================= */
+
+int FWTPM_NV_SetHAL(FWTPM_CTX* ctx, FWTPM_NV_HAL* hal)
+{
+    if (ctx == NULL || hal == NULL) {
+        return BAD_FUNC_ARG;
+    }
+    XMEMCPY(&ctx->nvHal, hal, sizeof(FWTPM_NV_HAL));
+    return TPM_RC_SUCCESS;
+}
+
+/* Generate fresh hierarchy seeds and default state, then persist via a compact
+ * save. Used on first run and whenever an existing journal cannot be loaded or
+ * authenticated. */
+static int FwNvGenFreshState(FWTPM_CTX* ctx)
+{
+    int rc;
+
+#ifdef DEBUG_WOLFTPM
+    printf("fwTPM: No NV state found, generating fresh seeds\n");
+#endif
+
+    rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->ownerSeed, FWTPM_SEED_SIZE);
+    if (rc == 0) {
+        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->endorsementSeed,
+            FWTPM_SEED_SIZE);
+    }
+    if (rc == 0) {
+        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->platformSeed,
+            FWTPM_SEED_SIZE);
+    }
+    if (rc == 0) {
+        rc = wc_RNG_GenerateBlock(&ctx->rng, ctx->nullSeed, FWTPM_SEED_SIZE);
+    }
+    if (rc != 0) {
+        return TPM_RC_FAILURE;
+    }
+
+    /* Auth values start empty */
+    XMEMSET(&ctx->ownerAuth, 0, sizeof(ctx->ownerAuth));
+    XMEMSET(&ctx->endorsementAuth, 0, sizeof(ctx->endorsementAuth));
+    XMEMSET(&ctx->platformAuth, 0, sizeof(ctx->platformAuth));
+    XMEMSET(&ctx->lockoutAuth, 0, sizeof(ctx->lockoutAuth));
+
+#ifndef FWTPM_NO_DA
+    /* DA protection defaults */
+    ctx->daMaxTries = FWTPM_DA_DEFAULT_MAX_TRIES;
+    ctx->daRecoveryTime = FWTPM_DA_DEFAULT_RECOVERY;
+    ctx->daLockoutRecovery = FWTPM_DA_DEFAULT_LOCKOUT_RECOVERY;
+    ctx->daFailedTries = 0;
+    ctx->daUsed = 0;
+    ctx->orderly = 1;
+#endif
+
+    /* PCR auth/policy defaults */
+    ctx->pcrAllocatedBanks = FWTPM_PCR_ALLOC_DEFAULT;
+
+    /* Save initial state (compact write) */
+    rc = FWTPM_NV_Save(ctx);
+#ifdef DEBUG_WOLFTPM
+    if (rc != TPM_RC_SUCCESS) {
+        printf("fwTPM: Warning: Failed to save initial NV state (%d)\n", rc);
+    }
+#endif
+    return rc;
+}
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+/* Decide whether a checkpoint entry that failed authentication is a torn
+ * (power-loss) write rather than tamper. Append-only programs whole writeAlign
+ * granules in order, so a torn checkpoint leaves its trailing granule erased
+ * (all 0xFF); a completely written checkpoint always has real bytes there. A
+ * storage attacker can only program bits (1->0), so an erased trailing granule
+ * cannot be forged. Returns 1 if the entry looks torn, 0 if fully written. */
+static int FwNvCheckpointTorn(FWTPM_CTX* ctx, word32 entryPos, word32 entryLen)
+{
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+    byte tail[FWTPM_NV_MAX_WRITE_ALIGN];
+    word32 align = hal->writeAlign;
+    word32 i;
+
+    if (align <= 1 || align > sizeof(tail) || entryLen < align) {
+        return 0; /* no granule semantics: treat a failing checkpoint as tamper */
+    }
+    if (hal->read(hal->ctx, entryPos + entryLen - align, tail, align)
+            != TPM_RC_SUCCESS) {
+        return 0;
+    }
+    for (i = 0; i < align; i++) {
+        if (tail[i] != 0xFF) {
+            return 0; /* trailing granule programmed: fully written */
+        }
+    }
+    return 1; /* trailing granule erased: torn write */
+}
+
+/* Load an append-only journal: scan for the last MAC checkpoint that
+ * authenticates the body before it, replay only the entries it covers, and
+ * rewrite cleanly if a torn trailing commit remains. A fully written
+ * checkpoint that fails authentication after a valid one is treated as
+ * tamper/rollback and rejected (only a torn trailing granule is recovered).
+ * Returns TPM_RC_SUCCESS (loaded), TPM_RC_NV_UNINITIALIZED (regenerate), or a
+ * negative error. */
+static int FwNvInitAppendOnly(FWTPM_CTX* ctx, byte** valueBufP,
+    word32* valueBufSzP)
+{
+    FWTPM_NV_HAL* hal = &ctx->nvHal;
+    byte tlvHdr[TLV_HDR_SIZE];
+    byte vKey[FWTPM_NV_KEY_SIZE];
+    byte storedMac[FWTPM_NV_MAC_SIZE];
+    byte calcMac[FWTPM_NV_MAC_SIZE];
+    byte* valueBuf = *valueBufP;
+    word32 valueBufSz = *valueBufSzP;
+    word32 vKeySz = 0;
+    word32 scanPos;
+    word32 lastMacStart = 0;
+    word32 lastMacEnd = 0;
+    word32 committedEnd;
+    word32 pos;
+    UINT16 tag, len;
+    int haveKey;
+    int tamper = 0;
+    int dirtyTail = 0;
+    int rc = TPM_RC_SUCCESS;
+
+    haveKey = FwNvGetIntegrityKey(ctx, vKey, &vKeySz);
+
+    /* Pass 1: locate the last authenticated MAC checkpoint. */
+    scanPos = (word32)sizeof(FWTPM_NV_HEADER);
+    while (scanPos + TLV_HDR_SIZE <= hal->maxSize) {
+        if (hal->read(hal->ctx, scanPos, tlvHdr, TLV_HDR_SIZE)
+                != TPM_RC_SUCCESS) {
+            break;
+        }
+        tag = FwLoadU16LE(tlvHdr);
+        len = FwLoadU16LE(tlvHdr + 2);
+        if (tag == FWTPM_NV_TAG_FREE) {
+            break; /* erased space: end of journal */
+        }
+        if (scanPos + TLV_HDR_SIZE + len > hal->maxSize) {
+            /* Non-free tag with no room for its body: a torn partial header
+             * (e.g. tag programmed, length still erased) left at the append
+             * offset. Mark the tail dirty so it is compacted away. */
+            dirtyTail = 1;
+            break;
+        }
+        if (tag == FWTPM_NV_TAG_MAC) {
+            int ok = 1;
+            if (haveKey) {
+                ok = 0;
+                if (len >= FWTPM_NV_MAC_SIZE) {
+                    /* MAC covers [header, scanPos). */
+                    ctx->nvWritePos = scanPos;
+                    if (hal->read(hal->ctx, scanPos + TLV_HDR_SIZE, storedMac,
+                            FWTPM_NV_MAC_SIZE) == TPM_RC_SUCCESS &&
+                        FwNvComputeJournalMac(ctx, vKey, vKeySz, calcMac)
+                            == TPM_RC_SUCCESS &&
+                        TPM2_ConstantCompare(storedMac, calcMac,
+                            FWTPM_NV_MAC_SIZE) == 0) {
+                        ok = 1;
+                    }
+                }
+            }
+            if (ok) {
+                lastMacStart = scanPos;
+                lastMacEnd = scanPos + TLV_HDR_SIZE + len;
+            }
+            else if (haveKey && len >= FWTPM_NV_MAC_SIZE && lastMacEnd != 0 &&
+                    !FwNvCheckpointTorn(ctx, scanPos, TLV_HDR_SIZE + len)) {
+                /* A fully written checkpoint that fails authentication after a
+                 * valid one is tamper/rollback, not a torn tail: reject. */
+                tamper = 1;
+                break;
+            }
+        }
+        scanPos += TLV_HDR_SIZE + len;
+    }
+    if (haveKey) {
+        TPM2_ForceZero(vKey, sizeof(vKey));
+    }
+
+    if (tamper || lastMacEnd == 0) {
+        /* Detected tamper, or no authenticated checkpoint at all. A valid save
+         * always ends with a checkpoint (keyed or not), so an uncheckpointed
+         * image is incomplete: discard (caller regenerates fresh state). */
+        return TPM_RC_NV_UNINITIALIZED;
+    }
+
+    committedEnd = lastMacStart;   /* replay data before this checkpoint */
+    ctx->nvWritePos = lastMacEnd;  /* next append position (aligned) */
+
+    /* Pass 2: replay committed data entries (skip MAC checkpoints). */
+    pos = (word32)sizeof(FWTPM_NV_HEADER);
+    while (pos + TLV_HDR_SIZE <= committedEnd) {
+        if (hal->read(hal->ctx, pos, tlvHdr, TLV_HDR_SIZE) != TPM_RC_SUCCESS) {
+            rc = TPM_RC_FAILURE;
+            break;
+        }
+        tag = FwLoadU16LE(tlvHdr);
+        len = FwLoadU16LE(tlvHdr + 2);
+        if (tag == FWTPM_NV_TAG_FREE) {
+            break;
+        }
+        if (pos + TLV_HDR_SIZE + len > committedEnd) {
+            break;
+        }
+        if (tag != FWTPM_NV_TAG_MAC) {
+            if (len > valueBufSz) {
+                byte* newBuf;
+                newBuf = (byte*)XMALLOC(len, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                if (newBuf == NULL) {
+                    rc = TPM_RC_MEMORY;
+                    break;
+                }
+                TPM2_ForceZero(valueBuf, valueBufSz);
+                XFREE(valueBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                valueBuf = newBuf;
+                valueBufSz = len;
+            }
+            if (len > 0) {
+                if (hal->read(hal->ctx, pos + TLV_HDR_SIZE, valueBuf, len)
+                        != TPM_RC_SUCCESS) {
+                    rc = TPM_RC_FAILURE;
+                    break;
+                }
+            }
+            FwNvProcessEntry(ctx, tag, valueBuf, len);
+        }
+        pos += TLV_HDR_SIZE + len;
+    }
+
+    *valueBufP = valueBuf;
+    *valueBufSzP = valueBufSz;
+
+    /* A torn commit after the last good checkpoint (trailing data entries, or
+     * a partial header at the append offset) leaves un-erased cells that block
+     * future appends; rewrite the recovered state cleanly. */
+    if (rc == TPM_RC_SUCCESS && (scanPos > lastMacEnd || dirtyTail)) {
+        rc = FWTPM_NV_Save(ctx);
+    }
+
+    return rc;
+}
+#endif /* WOLFTPM_FWTPM_NV_APPEND_ONLY */
+
+int FWTPM_NV_Init(FWTPM_CTX* ctx)
+{
+    int rc;
+    FWTPM_NV_HEADER hdr;
+    byte hdrBuf[sizeof(FWTPM_NV_HEADER)];
+    FWTPM_NV_HAL* hal;
+    word32 pos;
+    byte tlvHdr[TLV_HDR_SIZE];
+    byte* valueBuf = NULL;
+    word32 valueBufSz = FWTPM_NV_MAX_ENTRY;
+    byte vKey[FWTPM_NV_KEY_SIZE];
+    word32 vKeySz = 0;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    ctx->nvRebuild = 0;
+#endif
+
+    /* Use custom HAL if set, otherwise default file-based */
+    if (ctx->nvHal.read != NULL && ctx->nvHal.write != NULL) {
+        hal = &ctx->nvHal;
+    }
+#ifndef NO_FILESYSTEM
+    else {
+        hal = &fwNvDefaultHal;
+        XMEMCPY(&ctx->nvHal, hal, sizeof(FWTPM_NV_HAL));
+    }
+#else
+    else {
+        return BAD_FUNC_ARG; /* No NV HAL registered and no filesystem */
+    }
+#endif
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    /* Append-only program granule must fit the in-context staging buffer. */
+    if (FW_NV_APPEND_ONLY(hal) && hal->writeAlign > FWTPM_NV_MAX_WRITE_ALIGN) {
+        return BAD_FUNC_ARG;
+    }
+#endif
+
+    /* Allocate value read buffer */
+    valueBuf = (byte*)XMALLOC(valueBufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (valueBuf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    /* Try to read existing NV header */
+    XMEMSET(hdrBuf, 0, sizeof(hdrBuf));
+    rc = hal->read(hal->ctx, 0, hdrBuf, sizeof(hdrBuf));
+    if (rc == TPM_RC_SUCCESS) {
+        hdr.magic    = FwLoadU32LE(hdrBuf + 0);
+        hdr.version  = FwLoadU32LE(hdrBuf + 4);
+        hdr.writePos = FwLoadU32LE(hdrBuf + 8);
+        hdr.maxSize  = FwLoadU32LE(hdrBuf + 12);
+    }
+
+    if (rc == TPM_RC_SUCCESS && !FW_NV_APPEND_ONLY(hal) &&
+        hdr.magic == FWTPM_NV_MAGIC &&
+        hdr.version == FWTPM_NV_VERSION) {
+        /* Validate writePos against HAL bounds before using it */
+        if (hdr.writePos < sizeof(FWTPM_NV_HEADER) ||
+            hdr.writePos > hal->maxSize) {
+            /* Corrupt — treat as uninitialized, will generate fresh state */
+            rc = TPM_RC_NV_UNINITIALIZED;
+        }
+    }
+
+    /* Authenticate the journal before replaying it; a failed MAC discards it
+     * and regenerates rather than loading forged state. (Append-only
+     * authenticates per-checkpoint in FwNvInitAppendOnly instead.) */
+    if (rc == TPM_RC_SUCCESS && !FW_NV_APPEND_ONLY(hal) &&
+        hdr.magic == FWTPM_NV_MAGIC &&
+        hdr.version == FWTPM_NV_VERSION) {
+        ctx->nvWritePos = hdr.writePos;
+        if (FwNvGetIntegrityKey(ctx, vKey, &vKeySz)) {
+            byte storedMac[FWTPM_NV_MAC_SIZE];
+            byte calcMac[FWTPM_NV_MAC_SIZE];
+            if (ctx->nvWritePos + FWTPM_NV_MAC_SIZE > hal->maxSize ||
+                hal->read(hal->ctx, ctx->nvWritePos, storedMac,
+                    FWTPM_NV_MAC_SIZE) != TPM_RC_SUCCESS ||
+                FwNvComputeJournalMac(ctx, vKey, vKeySz, calcMac)
+                    != TPM_RC_SUCCESS ||
+                TPM2_ConstantCompare(storedMac, calcMac,
+                    FWTPM_NV_MAC_SIZE) != 0) {
+                rc = TPM_RC_NV_UNINITIALIZED;
+            }
+            TPM2_ForceZero(vKey, sizeof(vKey));
+        }
+    }
+
+    /* Append-only journals derive writePos by scanning (see FwNvInitAppendOnly). */
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    if (rc == TPM_RC_SUCCESS && FW_NV_APPEND_ONLY(hal) &&
+        hdr.magic == FWTPM_NV_MAGIC &&
+        hdr.version == FWTPM_NV_VERSION) {
+        rc = FwNvInitAppendOnly(ctx, &valueBuf, &valueBufSz);
+        if (rc == TPM_RC_NV_UNINITIALIZED) {
+            rc = FwNvGenFreshState(ctx); /* no authenticated journal */
+        }
+    }
+    else
+#endif
+    if (rc == TPM_RC_SUCCESS &&
+        hdr.magic == FWTPM_NV_MAGIC &&
+        hdr.version == FWTPM_NV_VERSION) {
+        /* Valid v3 TLV journal — scan entries */
+        ctx->nvWritePos = hdr.writePos;
+
+        pos = (word32)sizeof(FWTPM_NV_HEADER);
+        while (pos + TLV_HDR_SIZE <= ctx->nvWritePos) {
+            UINT16 tag, len;
+
+            rc = hal->read(hal->ctx, pos, tlvHdr, TLV_HDR_SIZE);
+            if (rc != TPM_RC_SUCCESS) {
+                break;
+            }
+
+            tag = FwLoadU16LE(tlvHdr);
+            len = FwLoadU16LE(tlvHdr + 2);
+
+            /* Check for free space marker (end of journal) */
+            if (tag == FWTPM_NV_TAG_FREE) {
+                break;
+            }
+
+            /* Validate entry bounds */
+            if (pos + TLV_HDR_SIZE + len > ctx->nvWritePos) {
+                break; /* Truncated entry - stop here */
+            }
+
+            /* Read value and dynamically expand buffer if needed */
+            if (len > valueBufSz) {
+                byte* newBuf;
+                newBuf = (byte*)XMALLOC(len, NULL,
+                    DYNAMIC_TYPE_TMP_BUFFER);
+                if (newBuf == NULL) {
+                    /* Do not silently report success on an allocation
+                     * failure mid-journal */
+                    rc = TPM_RC_MEMORY;
+                    break;
+                }
+                TPM2_ForceZero(valueBuf, valueBufSz);
+                XFREE(valueBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                valueBuf = newBuf;
+                valueBufSz = len;
+            }
+
+            if (len > 0) {
+                rc = hal->read(hal->ctx, pos + TLV_HDR_SIZE,
+                    valueBuf, len);
+                if (rc != TPM_RC_SUCCESS) {
+                    break;
+                }
+            }
+
+            FwNvProcessEntry(ctx, tag, valueBuf, len);
+            pos += TLV_HDR_SIZE + len;
+        }
+
+    #ifdef DEBUG_WOLFTPM
+        printf("fwTPM: NV journal loaded (v%d, %d bytes, %d entries)\n",
+            (int)hdr.version, (int)ctx->nvWritePos,
+            (int)((ctx->nvWritePos - sizeof(FWTPM_NV_HEADER))));
+    #endif
+        /* rc already reflects the scan: SUCCESS for a clean or
+         * end-of-journal stop, or a genuine read/alloc error to propagate
+         * rather than masking as success. */
+    }
+    else {
+        /* No valid NV image — generate fresh hierarchy seeds */
+        if (rc == TPM_RC_SUCCESS && hdr.magic == FWTPM_NV_MAGIC &&
+            hdr.version != FWTPM_NV_VERSION) {
+            fprintf(stderr, "WARNING: fwTPM NV version mismatch "
+                "(found %d, expected %d) — regenerating seeds\n",
+                (int)hdr.version, (int)FWTPM_NV_VERSION);
+        }
+        rc = FwNvGenFreshState(ctx);
+    }
+
+    TPM2_ForceZero(valueBuf, valueBufSz);
+    XFREE(valueBuf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+/* ========================================================================= */
+/* Full Save (Compaction)                                                    */
+/* ========================================================================= */
+
+/* Write all current state as a clean set of TLV entries (no duplicates).
+ * This is used on Shutdown, Clear, and when journal space runs out. */
+int FWTPM_NV_Save(FWTPM_CTX* ctx)
+{
+    FWTPM_NV_HAL* hal;
+    int rc = TPM_RC_SUCCESS;
+    int i;
+    byte* buf = NULL;
+    word32 bufSz = FWTPM_NV_MAX_ENTRY;
+    word32 pos;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    hal = &ctx->nvHal;
+    if (hal->write == NULL) {
+        return TPM_RC_FAILURE;
+    }
+
+    /* Allocate marshal buffer for largest single entry */
+    buf = (byte*)XMALLOC(bufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (buf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    ctx->nvCompacting = 1;
+
+    /* Erase NV storage */
+    if (hal->erase != NULL) {
+        rc = hal->erase(hal->ctx, 0, hal->maxSize);
+    }
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    /* Freshly erased: reset the pending granule so the rewrite streams from 0. */
+    ctx->nvGranuleBase = 0;
+    ctx->nvGranuleFill = 0;
+#endif
+
+    /* Reset write position to after header (only if erase succeeded) */
+    if (rc == 0) {
+        ctx->nvWritePos = (word32)sizeof(FWTPM_NV_HEADER);
+    }
+
+    /* Write header (will be updated at end with final writePos) */
+    if (rc == 0) {
+        rc = FwNvWriteHeader(ctx);
+    }
+
+    /* --- Seeds --- */
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_OWNER_SEED,
+            ctx->ownerSeed, FWTPM_SEED_SIZE);
+    }
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_ENDORSEMENT_SEED,
+            ctx->endorsementSeed, FWTPM_SEED_SIZE);
+    }
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PLATFORM_SEED,
+            ctx->platformSeed, FWTPM_SEED_SIZE);
+    }
+    /* Note: null seed is NOT persisted (re-randomized on Startup) */
+
+    /* --- Auth values --- */
+    if (rc == 0) {
+        pos = 0;
+        FwNvMarshalAuth(buf, &pos, bufSz, &ctx->ownerAuth);
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_OWNER_AUTH,
+            buf, (UINT16)pos);
+    }
+    if (rc == 0) {
+        pos = 0;
+        FwNvMarshalAuth(buf, &pos, bufSz, &ctx->endorsementAuth);
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_ENDORSEMENT_AUTH,
+            buf, (UINT16)pos);
+    }
+    if (rc == 0) {
+        pos = 0;
+        FwNvMarshalAuth(buf, &pos, bufSz, &ctx->platformAuth);
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PLATFORM_AUTH,
+            buf, (UINT16)pos);
+    }
+    if (rc == 0) {
+        pos = 0;
+        FwNvMarshalAuth(buf, &pos, bufSz, &ctx->lockoutAuth);
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_LOCKOUT_AUTH,
+            buf, (UINT16)pos);
+    }
+
+    /* --- PCR state --- */
+    if (rc == 0) {
+        pos = 0;
+        FwNvMarshalBytes(buf, &pos, bufSz,
+            (const byte*)ctx->pcrDigest, sizeof(ctx->pcrDigest));
+        FwNvMarshalU32(buf, &pos, bufSz, ctx->pcrUpdateCounter);
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PCR_STATE,
+            buf, (UINT16)pos);
+    }
+
+    /* --- PCR auth/policy (only if any are set) --- */
+    if (rc == 0) {
+        int hasPcrAuth = 0;
+        for (i = 0; i < IMPLEMENTATION_PCR; i++) {
+            if (ctx->pcrAuth[i].size > 0 || ctx->pcrPolicy[i].size > 0) {
+                hasPcrAuth = 1;
+                break;
+            }
+        }
+        if (hasPcrAuth || ctx->pcrAllocatedBanks != FWTPM_PCR_ALLOC_DEFAULT) {
+            word32 needed = 1 + IMPLEMENTATION_PCR * (2 + 64 + 2 + 64 + 2);
+            if (needed > bufSz) {
+                byte* newBuf;
+                newBuf = (byte*)XMALLOC(needed, NULL,
+                    DYNAMIC_TYPE_TMP_BUFFER);
+                if (newBuf == NULL) {
+                    rc = TPM_RC_MEMORY;
+                }
+                else {
+                    TPM2_ForceZero(buf, bufSz);
+                    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                    buf = newBuf;
+                    bufSz = needed;
+                }
+            }
+            if (rc == 0) {
+                pos = 0;
+                FwNvMarshalU8(buf, &pos, bufSz, ctx->pcrAllocatedBanks);
+                for (i = 0; i < IMPLEMENTATION_PCR; i++) {
+                    FwNvMarshalAuth(buf, &pos, bufSz, &ctx->pcrAuth[i]);
+                    FwNvMarshalDigest(buf, &pos, bufSz,
+                        &ctx->pcrPolicy[i]);
+                    FwNvMarshalU16(buf, &pos, bufSz,
+                        ctx->pcrPolicyAlg[i]);
+                }
+                rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PCR_AUTH,
+                    buf, (UINT16)pos);
+            }
+        }
+    }
+
+    /* --- Flags --- */
+    if (rc == 0) {
+        pos = 0;
+        FwNvMarshalU8(buf, &pos, bufSz,
+            (UINT8)((ctx->disableClear ? 0x01 : 0x00) |
+            (ctx->globalNvWriteLock ? 0x02 : 0x00)
+        #ifndef FWTPM_NO_DA
+            | (ctx->orderly ? 0x04 : 0x00)
+            | (ctx->lockoutAuthFailed ? 0x08 : 0x00)
+        #endif
+            /* Hierarchy-disabled bits are inverted so a pre-existing journal
+             * (bits clear) loads as all hierarchies enabled. */
+            | (ctx->shDisabled ? 0x10 : 0x00)
+            | (ctx->ehDisabled ? 0x20 : 0x00)
+            | (ctx->phDisabled ? 0x40 : 0x00)
+            | (ctx->phNvDisabled ? 0x80 : 0x00)
+            ));
+    #ifndef FWTPM_NO_DA
+        FwNvMarshalU32(buf, &pos, bufSz, ctx->daMaxTries);
+        FwNvMarshalU32(buf, &pos, bufSz, ctx->daRecoveryTime);
+        FwNvMarshalU32(buf, &pos, bufSz, ctx->daLockoutRecovery);
+    #endif
+        FwNvMarshalU32(buf, &pos, bufSz, ctx->resetCount);
+    #ifndef FWTPM_NO_DA
+        FwNvMarshalU32(buf, &pos, bufSz, ctx->daFailedTries);
+    #endif
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_FLAGS, buf, (UINT16)pos);
+    }
+
+    /* --- Clock offset --- */
+    if (rc == 0 && ctx->clockOffset != 0) {
+        pos = 0;
+        FwNvMarshalU32(buf, &pos, bufSz,
+            (UINT32)(ctx->clockOffset & 0xFFFFFFFF));
+        FwNvMarshalU32(buf, &pos, bufSz,
+            (UINT32)(ctx->clockOffset >> 32));
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_CLOCK, buf, (UINT16)pos);
+    }
+
+    /* --- Hierarchy policies --- */
+    for (i = 0; i < 4 && rc == 0; i++) {
+        UINT32 hier;
+        TPM2B_DIGEST* policy;
+        TPMI_ALG_HASH alg;
+
+        switch (i) {
+            case 0:
+                hier = TPM_RH_OWNER;
+                policy = &ctx->ownerPolicy;
+                alg = ctx->ownerPolicyAlg;
+                break;
+            case 1:
+                hier = TPM_RH_ENDORSEMENT;
+                policy = &ctx->endorsementPolicy;
+                alg = ctx->endorsementPolicyAlg;
+                break;
+            case 2:
+                hier = TPM_RH_PLATFORM;
+                policy = &ctx->platformPolicy;
+                alg = ctx->platformPolicyAlg;
+                break;
+            default:
+                hier = TPM_RH_LOCKOUT;
+                policy = &ctx->lockoutPolicy;
+                alg = ctx->lockoutPolicyAlg;
+                break;
+        }
+
+        if (policy->size > 0) {
+            pos = 0;
+            FwNvMarshalU32(buf, &pos, bufSz, hier);
+            FwNvMarshalU16(buf, &pos, bufSz, alg);
+            FwNvMarshalDigest(buf, &pos, bufSz, policy);
+            rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_HIERARCHY_POLICY,
+                buf, (UINT16)pos);
+        }
+    }
+
+    /* --- NV indices (only used slots, minus a pending deletion) --- */
+    for (i = 0; i < FWTPM_MAX_NV_INDICES && rc == 0; i++) {
+        if (ctx->nvIndices[i].inUse &&
+                ctx->nvIndices[i].nvPublic.nvIndex != ctx->nvDeleteHandle) {
+            word32 needed;
+            pos = 0;
+            /* Estimate: ensure buf is large enough */
+            needed = 4 + 2 + 4 + FWTPM_NV_NAME_EST + 2 + /* nvPublic */
+                     FWTPM_NV_AUTH_EST + /* auth */
+                     1 + 2 + ctx->nvIndices[i].nvPublic.dataSize;
+            if (needed > bufSz) {
+                byte* newBuf;
+                newBuf = (byte*)XMALLOC(needed, NULL,
+                    DYNAMIC_TYPE_TMP_BUFFER);
+                if (newBuf == NULL) {
+                    rc = TPM_RC_MEMORY;
+                    break;
+                }
+                TPM2_ForceZero(buf, bufSz);
+                XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                buf = newBuf;
+                bufSz = needed;
+            }
+            rc = FwNvMarshalNvIndex(buf, &pos, bufSz, &ctx->nvIndices[i]);
+            if (rc == 0) {
+                rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_NV_INDEX,
+                    buf, (UINT16)pos);
+            }
+        }
+    }
+
+    /* --- Persistent objects (only used slots, minus a pending deletion) --- */
+    for (i = 0; i < FWTPM_MAX_PERSISTENT && rc == 0; i++) {
+        if (ctx->persistent[i].used &&
+                ctx->persistent[i].handle != ctx->nvDeleteHandle) {
+            word32 needed;
+            pos = 0;
+            needed = 4 + FWTPM_NV_PUBAREA_EST + FWTPM_NV_NAME_EST + 2 +
+                     ctx->persistent[i].privKeySize + FWTPM_NV_AUTH_EST;
+            if (needed > bufSz) {
+                byte* newBuf;
+                newBuf = (byte*)XMALLOC(needed, NULL,
+                    DYNAMIC_TYPE_TMP_BUFFER);
+                if (newBuf == NULL) {
+                    rc = TPM_RC_MEMORY;
+                    break;
+                }
+                TPM2_ForceZero(buf, bufSz);
+                XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                buf = newBuf;
+                bufSz = needed;
+            }
+            rc = FwNvMarshalObject(buf, &pos, bufSz, &ctx->persistent[i]);
+            if (rc == 0) {
+                rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PERSISTENT,
+                    buf, (UINT16)pos);
+            }
+        }
+    }
+
+    /* --- Primary cache (only used slots) --- */
+    for (i = 0; i < FWTPM_MAX_PRIMARY_CACHE && rc == 0; i++) {
+        if (ctx->primaryCache[i].used) {
+            word32 needed;
+            pos = 0;
+            needed = 4 + 32 + FWTPM_NV_PUBAREA_EST + 2 +
+                     ctx->primaryCache[i].privKeySize;
+            if (needed > bufSz) {
+                byte* newBuf;
+                newBuf = (byte*)XMALLOC(needed, NULL,
+                    DYNAMIC_TYPE_TMP_BUFFER);
+                if (newBuf == NULL) {
+                    rc = TPM_RC_MEMORY;
+                    break;
+                }
+                TPM2_ForceZero(buf, bufSz);
+                XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+                buf = newBuf;
+                bufSz = needed;
+            }
+            rc = FwNvMarshalPrimaryCache(buf, &pos, bufSz,
+                &ctx->primaryCache[i]);
+            if (rc == 0) {
+                rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PRIMARY_CACHE,
+                    buf, (UINT16)pos);
+            }
+        }
+    }
+
+    /* Seal the journal: append-only adds one trailing checkpoint (header was
+     * written after the erase); byte-addressable updates the header in place. */
+    if (rc == 0) {
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+        if (FW_NV_APPEND_ONLY(hal)) {
+            rc = FwNvAppendCheckpoint(ctx);
+        }
+        else
+#endif
+        {
+            rc = FwNvWriteHeader(ctx);
+        }
+    }
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    /* A compaction that did not reach its checkpoint leaves the rewritten
+     * snapshot unsealed on the log, so it must be rebuilt before any append. */
+    ctx->nvRebuild = (rc != TPM_RC_SUCCESS);
+#endif
+
+#ifdef DEBUG_WOLFTPM
+    printf("fwTPM: NV saved (compact, %d bytes)\n", (int)ctx->nvWritePos);
+#endif
+
+    ctx->nvCompacting = 0;
+    TPM2_ForceZero(buf, bufSz);
+    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+/* ========================================================================= */
+/* Targeted Save Functions                                                   */
+/* ========================================================================= */
+
+int FWTPM_NV_SaveSeeds(FWTPM_CTX* ctx)
+{
+    int rc;
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_OWNER_SEED,
+        ctx->ownerSeed, FWTPM_SEED_SIZE);
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_ENDORSEMENT_SEED,
+            ctx->endorsementSeed, FWTPM_SEED_SIZE);
+    }
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PLATFORM_SEED,
+            ctx->platformSeed, FWTPM_SEED_SIZE);
+    }
+    return rc;
+}
+
+int FWTPM_NV_SaveAuth(FWTPM_CTX* ctx, UINT32 hierarchy)
+{
+    int rc;
+    byte buf[2 + TPM_SHA384_DIGEST_SIZE];
+    word32 pos = 0;
+    UINT16 tag;
+    TPM2B_AUTH* auth;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    switch (hierarchy) {
+        case TPM_RH_OWNER:
+            tag = FWTPM_NV_TAG_OWNER_AUTH;
+            auth = &ctx->ownerAuth;
+            break;
+        case TPM_RH_ENDORSEMENT:
+            tag = FWTPM_NV_TAG_ENDORSEMENT_AUTH;
+            auth = &ctx->endorsementAuth;
+            break;
+        case TPM_RH_PLATFORM:
+            tag = FWTPM_NV_TAG_PLATFORM_AUTH;
+            auth = &ctx->platformAuth;
+            break;
+        case TPM_RH_LOCKOUT:
+            tag = FWTPM_NV_TAG_LOCKOUT_AUTH;
+            auth = &ctx->lockoutAuth;
+            break;
+        default:
+            return TPM_RC_HIERARCHY;
+    }
+
+    rc = FwNvMarshalAuth(buf, &pos, sizeof(buf), auth);
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, tag, buf, (UINT16)pos);
+    }
+    TPM2_ForceZero(buf, sizeof(buf));
+    return rc;
+}
+
+int FWTPM_NV_SavePcrState(FWTPM_CTX* ctx)
+{
+    int rc;
+    byte* buf;
+    word32 pos = 0;
+    word32 bufSz = (word32)sizeof(ctx->pcrDigest) + 4;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    buf = (byte*)XMALLOC(bufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (buf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    FwNvMarshalBytes(buf, &pos, bufSz,
+        (const byte*)ctx->pcrDigest, sizeof(ctx->pcrDigest));
+    FwNvMarshalU32(buf, &pos, bufSz, ctx->pcrUpdateCounter);
+
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PCR_STATE, buf, (UINT16)pos);
+
+    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+int FWTPM_NV_SavePcrAuth(FWTPM_CTX* ctx)
+{
+    int rc;
+    int i;
+    byte* buf;
+    word32 pos = 0;
+    word32 bufSz = 1 + IMPLEMENTATION_PCR * (2 + 64 + 2 + 64 + 2);
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    buf = (byte*)XMALLOC(bufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (buf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    FwNvMarshalU8(buf, &pos, bufSz, ctx->pcrAllocatedBanks);
+    for (i = 0; i < IMPLEMENTATION_PCR; i++) {
+        FwNvMarshalAuth(buf, &pos, bufSz, &ctx->pcrAuth[i]);
+        FwNvMarshalDigest(buf, &pos, bufSz, &ctx->pcrPolicy[i]);
+        FwNvMarshalU16(buf, &pos, bufSz, ctx->pcrPolicyAlg[i]);
+    }
+
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PCR_AUTH, buf, (UINT16)pos);
+
+    TPM2_ForceZero(buf, bufSz);
+    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+int FWTPM_NV_SaveFlags(FWTPM_CTX* ctx)
+{
+#ifdef FWTPM_NO_NV
+    /* No persistence without NV; nothing to save (callers treat as success) */
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+    return TPM_RC_SUCCESS;
+#else
+    int rc;
+    byte buf[1 + 12 + 4 + 4]; /* flags + DA params + resetCount + failedTries */
+    word32 pos = 0;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    FwNvMarshalU8(buf, &pos, sizeof(buf),
+        (UINT8)((ctx->disableClear ? 0x01 : 0x00) |
+            (ctx->globalNvWriteLock ? 0x02 : 0x00)
+#ifndef FWTPM_NO_DA
+            | (ctx->orderly ? 0x04 : 0x00)
+            | (ctx->lockoutAuthFailed ? 0x08 : 0x00)
+#endif
+            | (ctx->shDisabled ? 0x10 : 0x00)
+            | (ctx->ehDisabled ? 0x20 : 0x00)
+            | (ctx->phDisabled ? 0x40 : 0x00)
+            | (ctx->phNvDisabled ? 0x80 : 0x00)
+            ));
+#ifndef FWTPM_NO_DA
+    FwNvMarshalU32(buf, &pos, sizeof(buf), ctx->daMaxTries);
+    FwNvMarshalU32(buf, &pos, sizeof(buf), ctx->daRecoveryTime);
+    FwNvMarshalU32(buf, &pos, sizeof(buf), ctx->daLockoutRecovery);
+#endif
+    FwNvMarshalU32(buf, &pos, sizeof(buf), ctx->resetCount);
+#ifndef FWTPM_NO_DA
+    FwNvMarshalU32(buf, &pos, sizeof(buf), ctx->daFailedTries);
+#endif
+
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_FLAGS, buf, (UINT16)pos);
+    return rc;
+#endif /* FWTPM_NO_NV */
+}
+
+int FWTPM_NV_SaveClock(FWTPM_CTX* ctx)
+{
+    int rc;
+    byte buf[8]; /* UINT64 as two U32 (lo, hi) */
+    word32 pos = 0;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    FwNvMarshalU32(buf, &pos, sizeof(buf),
+        (UINT32)(ctx->clockOffset & 0xFFFFFFFF));
+    FwNvMarshalU32(buf, &pos, sizeof(buf),
+        (UINT32)(ctx->clockOffset >> 32));
+
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_CLOCK, buf, (UINT16)pos);
+    return rc;
+}
+
+int FWTPM_NV_SaveHierarchyPolicy(FWTPM_CTX* ctx, UINT32 hierarchy)
+{
+    int rc;
+    byte buf[4 + 2 + 2 + 64]; /* hierarchy + alg + digest */
+    word32 pos = 0;
+    TPM2B_DIGEST* policy;
+    TPMI_ALG_HASH alg;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    switch (hierarchy) {
+        case TPM_RH_OWNER:
+            policy = &ctx->ownerPolicy;
+            alg = ctx->ownerPolicyAlg;
+            break;
+        case TPM_RH_ENDORSEMENT:
+            policy = &ctx->endorsementPolicy;
+            alg = ctx->endorsementPolicyAlg;
+            break;
+        case TPM_RH_PLATFORM:
+            policy = &ctx->platformPolicy;
+            alg = ctx->platformPolicyAlg;
+            break;
+        case TPM_RH_LOCKOUT:
+            policy = &ctx->lockoutPolicy;
+            alg = ctx->lockoutPolicyAlg;
+            break;
+        default:
+            return TPM_RC_HIERARCHY;
+    }
+
+    FwNvMarshalU32(buf, &pos, sizeof(buf), hierarchy);
+    FwNvMarshalU16(buf, &pos, sizeof(buf), alg);
+    FwNvMarshalDigest(buf, &pos, sizeof(buf), policy);
+
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_HIERARCHY_POLICY,
+        buf, (UINT16)pos);
+    return rc;
+}
+
+int FWTPM_NV_SaveNvIndex(FWTPM_CTX* ctx, int slot)
+{
+    int rc;
+    byte* buf;
+    word32 pos = 0;
+    word32 bufSz;
+    const FWTPM_NvIndex* nv;
+
+    if (ctx == NULL || slot < 0 || slot >= FWTPM_MAX_NV_INDICES) {
+        return BAD_FUNC_ARG;
+    }
+
+    nv = &ctx->nvIndices[slot];
+    if (!nv->inUse) {
+        return BAD_FUNC_ARG;
+    }
+
+    /* Estimate buffer size */
+    bufSz = 4 + 2 + 4 + 2 + FWTPM_NV_NAME_EST + 2 + /* nvPublic */
+            FWTPM_NV_AUTH_EST + /* auth */
+            1 + 2 + nv->nvPublic.dataSize; /* written + data */
+
+    buf = (byte*)XMALLOC(bufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (buf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    rc = FwNvMarshalNvIndex(buf, &pos, bufSz, nv);
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_NV_INDEX,
+            buf, (UINT16)pos);
+    }
+
+    TPM2_ForceZero(buf, bufSz);
+    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+int FWTPM_NV_DeleteNvIndex(FWTPM_CTX* ctx, UINT32 nvHandle)
+{
+    int rc;
+    byte buf[4];
+    word32 pos = 0;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    FwNvMarshalU32(buf, &pos, sizeof(buf), nvHandle);
+    ctx->nvDeleteHandle = nvHandle;
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_NV_INDEX_DEL, buf, (UINT16)pos);
+    ctx->nvDeleteHandle = 0;
+    return rc;
+}
+
+int FWTPM_NV_SavePersistent(FWTPM_CTX* ctx, int slot)
+{
+    int rc;
+    byte* buf;
+    word32 pos = 0;
+    word32 bufSz;
+    const FWTPM_Object* obj;
+
+    if (ctx == NULL || slot < 0 || slot >= FWTPM_MAX_PERSISTENT) {
+        return BAD_FUNC_ARG;
+    }
+
+    obj = &ctx->persistent[slot];
+    if (!obj->used) {
+        return BAD_FUNC_ARG;
+    }
+
+    bufSz = 4 + FWTPM_NV_PUBAREA_EST + 2 + FWTPM_NV_NAME_EST + 2 +
+            obj->privKeySize + 2 + FWTPM_NV_AUTH_EST;
+
+    buf = (byte*)XMALLOC(bufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (buf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    rc = FwNvMarshalObject(buf, &pos, bufSz, obj);
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PERSISTENT,
+            buf, (UINT16)pos);
+    }
+
+    TPM2_ForceZero(buf, bufSz);
+    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+int FWTPM_NV_DeletePersistent(FWTPM_CTX* ctx, UINT32 handle)
+{
+    int rc;
+    byte buf[4];
+    word32 pos = 0;
+
+    if (ctx == NULL) {
+        return BAD_FUNC_ARG;
+    }
+
+    FwNvMarshalU32(buf, &pos, sizeof(buf), handle);
+    ctx->nvDeleteHandle = handle;
+    rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PERSISTENT_DEL, buf, (UINT16)pos);
+    ctx->nvDeleteHandle = 0;
+    return rc;
+}
+
+int FWTPM_NV_SavePrimaryCache(FWTPM_CTX* ctx, int slot)
+{
+    int rc;
+    byte* buf;
+    word32 pos = 0;
+    word32 bufSz;
+    const FWTPM_PrimaryCache* cache;
+
+    if (ctx == NULL || slot < 0 || slot >= FWTPM_MAX_PRIMARY_CACHE) {
+        return BAD_FUNC_ARG;
+    }
+
+    cache = &ctx->primaryCache[slot];
+    if (!cache->used) {
+        return BAD_FUNC_ARG;
+    }
+
+    bufSz = 4 + 32 + FWTPM_NV_PUBAREA_EST + 2 + cache->privKeySize;
+
+    buf = (byte*)XMALLOC(bufSz, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    if (buf == NULL) {
+        return TPM_RC_MEMORY;
+    }
+
+    rc = FwNvMarshalPrimaryCache(buf, &pos, bufSz, cache);
+    if (rc == 0) {
+        rc = FwNvAppendEntry(ctx, FWTPM_NV_TAG_PRIMARY_CACHE,
+            buf, (UINT16)pos);
+    }
+
+    TPM2_ForceZero(buf, bufSz);
+    XFREE(buf, NULL, DYNAMIC_TYPE_TMP_BUFFER);
+    return rc;
+}
+
+#endif /* WOLFTPM_FWTPM */

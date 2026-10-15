@@ -1,0 +1,1035 @@
+/* fwtpm.h
+ *
+ * Copyright (C) 2006-2026 wolfSSL Inc.
+ *
+ * This file is part of wolfTPM.
+ *
+ * wolfTPM is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * wolfTPM is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335, USA
+ */
+
+#ifndef _FWTPM_H_
+#define _FWTPM_H_
+
+#ifdef WOLFTPM_FWTPM
+
+/* WOLFTPM_SMALL_STACK requires heap allocation, incompatible with NO_HEAP */
+#if defined(WOLFTPM_SMALL_STACK) && defined(WOLFTPM2_NO_HEAP)
+    #error "WOLFTPM_SMALL_STACK and WOLFTPM2_NO_HEAP cannot be used together"
+#endif
+
+#include <wolftpm/tpm2.h>
+#include <wolftpm/tpm2_packet.h>
+
+#ifndef WOLFTPM2_NO_WOLFCRYPT
+#include <wolfssl/wolfcrypt/random.h>
+#include <wolfssl/wolfcrypt/rsa.h>
+#include <wolfssl/wolfcrypt/ecc.h>
+#include <wolfssl/wolfcrypt/hash.h>
+#include <wolfssl/wolfcrypt/hmac.h>
+#endif
+
+#ifdef WOLFTPM_FWTPM_TIS
+#include <wolftpm/fwtpm/fwtpm_tis.h>
+#endif
+
+/* P-521 needs both wolfCrypt curve support and 66-byte TPM ECC fields. */
+#if defined(HAVE_ECC) && \
+    (defined(HAVE_ECC521) || defined(HAVE_ALL_CURVES)) && \
+    MAX_ECC_KEY_BYTES >= 66
+    #if !defined(ECC_MIN_KEY_SZ) || ECC_MIN_KEY_SZ <= 521
+        #define FWTPM_HAVE_ECC521
+    #endif
+#endif
+
+/* Endian byte-array helpers - use shared TPM2_Packet helpers.
+ * Note: argument order differs (Fw: buf,val; TPM2_Packet: val,buf) */
+#define FwStoreU16BE(buf, val) TPM2_Packet_U16ToByteArray((val), (buf))
+#define FwStoreU32BE(buf, val) TPM2_Packet_U32ToByteArray((val), (buf))
+#define FwStoreU64BE(buf, val) TPM2_Packet_U64ToByteArray((val), (buf))
+#define FwLoadU16BE(buf)       TPM2_Packet_ByteArrayToU16(buf)
+#define FwLoadU32BE(buf)       TPM2_Packet_ByteArrayToU32(buf)
+#define FwLoadU64BE(buf)       TPM2_Packet_ByteArrayToU64(buf)
+#define FwStoreU16LE(buf, val) TPM2_Packet_U16ToByteArrayLE((val), (buf))
+#define FwStoreU32LE(buf, val) TPM2_Packet_U32ToByteArrayLE((val), (buf))
+#define FwLoadU16LE(buf)       TPM2_Packet_ByteArrayToU16LE(buf)
+#define FwLoadU32LE(buf)       TPM2_Packet_ByteArrayToU32LE(buf)
+#define FwStoreU64LE(buf, val) do { \
+    FwStoreU32LE((buf), (UINT32)(val)); \
+    FwStoreU32LE((buf) + 4, (UINT32)((UINT64)(val) >> 32)); \
+} while (0)
+#define FwLoadU64LE(buf) \
+    ((UINT64)FwLoadU32LE(buf) | ((UINT64)FwLoadU32LE((buf) + 4) << 32))
+
+#ifdef __cplusplus
+    extern "C" {
+#endif
+
+/* fwTPM version */
+#define FWTPM_VERSION_MAJOR    0
+#define FWTPM_VERSION_MINOR    1
+#define FWTPM_VERSION_PATCH    0
+#define FWTPM_VERSION_STRING   "0.1.0"
+
+/* Manufacturer identity for GetCapability */
+#define FWTPM_MANUFACTURER     "WOLF"
+#define FWTPM_VENDOR_STRING    "wolfTPM"
+#define FWTPM_MODEL            "fwTPM"
+#define FWTPM_FIRMWARE_V1      FWTPM_VERSION_MAJOR
+#define FWTPM_FIRMWARE_V2      FWTPM_VERSION_MINOR
+
+/* Default ports - socket transport only (not used in TIS mode) */
+#ifndef WOLFTPM_FWTPM_TIS
+    #ifndef FWTPM_CMD_PORT
+    #define FWTPM_CMD_PORT     2321
+    #endif
+    #ifndef FWTPM_PLAT_PORT
+    #define FWTPM_PLAT_PORT    2322
+    #endif
+#endif
+
+/* Limits */
+#ifndef FWTPM_MAX_COMMAND_SIZE
+    /* PQC sig responses (header + paramSize + TPM2B_SIGNATURE + auth area)
+     * exceed 4096 once MLDSA-87 is enabled (sig alone = 4627). MLDSA-65
+     * (3309 sig) leaves only ~700 B headroom inside 4096 — safe but tight,
+     * so we still lift to 8192 to keep public-key transport comfortable.
+     * MLDSA-44-only and MLKEM-only builds stay at 4096. */
+    #if defined(WOLFTPM_V185) && \
+        (!defined(WOLFSSL_NO_ML_DSA_65) || !defined(WOLFSSL_NO_ML_DSA_87))
+        #define FWTPM_MAX_COMMAND_SIZE 8192
+    #else
+        #define FWTPM_MAX_COMMAND_SIZE 4096
+    #endif
+#endif
+
+/* Maximum random bytes per GetRandom call */
+#ifndef FWTPM_MAX_RANDOM_BYTES
+#define FWTPM_MAX_RANDOM_BYTES 48
+#endif
+
+/* Command feature-group toggles - opt-in macros that compile out fwTPM command
+ * groups a minimal build does not need. All default OFF (the full command set is
+ * built). Removing a group drops its handlers AND its TPM2_GetCapability
+ * advertisement (the command list is derived from the dispatch table).
+ *   FWTPM_NO_POLICY        - policy session commands (TPM2_Policy*)
+ *   FWTPM_NO_ATTESTATION   - Quote/Certify/CertifyCreation/GetTime/NV_Certify
+ *   FWTPM_NO_CREDENTIAL    - MakeCredential/ActivateCredential
+ *   FWTPM_NO_DA            - dictionary-attack lockout protection (see below)
+ *   FWTPM_NO_PARAM_ENC     - command/response parameter encryption
+ *   FWTPM_NO_NV            - all NV_* commands
+ *   FWTPM_NO_KEY_MIGRATION - Import/Duplicate/Rewrap
+ *   FWTPM_NO_ECDH          - ECDH_KeyGen/ECDH_ZGen/EC_Ephemeral/ZGen_2Phase/
+ *                            ECC_Parameters (ECDSA sign/verify are retained)
+ *   FWTPM_NO_HASH_CMDS     - Hash, HMAC, and the hash/HMAC sequence commands
+ *   FWTPM_NO_CONTEXT       - ContextSave/ContextLoad (FlushContext retained)
+ *   FWTPM_NO_SYM_ENCRYPT   - EncryptDecrypt/EncryptDecrypt2
+ *   FWTPM_NO_CLOCK         - ReadClock/ClockSet/ClockRateAdjust
+ *   FWTPM_NO_PP            - PolicyPhysicalPresence and physical-presence
+ *                           enforcement (drops the PP HAL, latch, and
+ *                           FWTPM_PP_SetHAL)
+ *
+ * These flags are independent; select exactly the command groups your fTPM does
+ * not need. There is intentionally no single "minimal" umbrella macro - dropping
+ * a command group removes real TPM functionality, so each choice must be made
+ * deliberately. For a worked example that picks a set for a constrained target,
+ * see the MicroBlaze V build in the wolftpm-examples repository.
+ *
+ * Gates that own per-instance state also drop it from FWTPM_CTX below, so the
+ * RAM saving is real and not just code size:
+ *   FWTPM_NO_HASH_CMDS - hashSeq[FWTPM_MAX_HASH_SEQ]. The FWTPM_MAX_HASH_SEQ
+ *                        macro itself stays defined: MLDSA sequence handles are
+ *                        numbered above the hash-sequence range, so removing it
+ *                        would renumber them between gated and ungated builds.
+ *   FWTPM_NO_CONTEXT   - ctxProtectKey/ctxProtectKeyValid, contextSeqCounter,
+ *                        contextLive[]/contextLiveCount
+ *   FWTPM_NO_ECDH      - ecEphemeralCounter/Key/KeySz/Curve */
+
+/* Dictionary Attack (DA) feature toggles:
+ *   FWTPM_NO_DA          - compile out all DA lockout protection.
+ *   FWTPM_DA_USED_RETRY  - emulate real-TPM behavior where the first use of a
+ *                          DA-protected (non-noDA) authorization after startup
+ *                          persists the daUsed flag to NV and returns
+ *                          TPM_RC_RETRY, prompting the caller to resubmit.
+ *                          Off by default. The client does not auto-resubmit;
+ *                          callers must resend the command on TPM_RC_RETRY. */
+#ifndef FWTPM_DA_DEFAULT_MAX_TRIES
+#define FWTPM_DA_DEFAULT_MAX_TRIES          32
+#endif
+#ifndef FWTPM_DA_DEFAULT_RECOVERY
+#define FWTPM_DA_DEFAULT_RECOVERY           600     /* seconds */
+#endif
+#ifndef FWTPM_DA_DEFAULT_LOCKOUT_RECOVERY
+#define FWTPM_DA_DEFAULT_LOCKOUT_RECOVERY   86400   /* seconds */
+#endif
+#ifndef FWTPM_DA_MAX_TRIES_LIMIT
+#define FWTPM_DA_MAX_TRIES_LIMIT            0xFFFF
+#endif
+
+/* Maximum transient objects loaded at once (TPM 2.0 spec minimum: 3) */
+#ifndef FWTPM_MAX_OBJECTS
+#define FWTPM_MAX_OBJECTS      3
+#endif
+
+/* Maximum persistent objects (EvictControl) */
+#ifndef FWTPM_MAX_PERSISTENT
+#define FWTPM_MAX_PERSISTENT   8
+#endif
+
+/* Maximum private key DER size (RSA 2048 ~1193 bytes, ECC P384 ~167 bytes) */
+#ifndef FWTPM_MAX_PRIVKEY_DER
+    #ifdef NO_RSA
+        #define FWTPM_MAX_PRIVKEY_DER  256
+    #else
+        #define FWTPM_MAX_PRIVKEY_DER  1280
+    #endif
+#endif
+
+/* Maximum sensitive area buffer: private key DER + wire-format overhead
+ * (sensitiveType(2) + authValue(2+64) + seedValue(2+48) + size(2) = ~120) */
+#define FWTPM_MAX_SENSITIVE_SIZE  (FWTPM_MAX_PRIVKEY_DER + 128)
+
+/* Maximum concurrent hash sequences */
+#ifndef FWTPM_MAX_HASH_SEQ
+#define FWTPM_MAX_HASH_SEQ     4
+#endif
+
+/* Maximum cached primary keys (one per hierarchy) */
+#ifndef FWTPM_MAX_PRIMARY_CACHE
+#define FWTPM_MAX_PRIMARY_CACHE 4
+#endif
+
+/* Maximum concurrent auth sessions */
+#ifndef FWTPM_MAX_SESSIONS
+#define FWTPM_MAX_SESSIONS     4
+#endif
+
+/* Maximum NV indices (user NV RAM slots) */
+#ifndef FWTPM_MAX_NV_INDICES
+#define FWTPM_MAX_NV_INDICES   16
+#endif
+
+/* Maximum data size for a single NV index (per spec 2048, NV_EXTEND = hashSz) */
+#ifndef FWTPM_MAX_NV_DATA
+#define FWTPM_MAX_NV_DATA      2048
+#endif
+
+/* Internal buffer sizes — auto-shrink based on the largest enabled PQC
+ * parameter set (see FWTPM_MAX_MLDSA_xxx and FWTPM_MAX_MLKEM_xxx above).
+ * All macros remain ifndef-guarded for per-board overrides. See
+ * docs/FWTPM.md "v1.85 Embedded RAM Impact" for resolved values per build.
+ */
+/* PQC per-parameter-set sizes (FIPS 203 / FIPS 204, spec-immutable). Defined
+ * locally so size-resolution below works without including wolfCrypt PQC
+ * headers (which may be absent on subset builds). */
+#define FWTPM_MLDSA_44_PUB_SIZE   1312
+#define FWTPM_MLDSA_44_SIG_SIZE   2420
+#define FWTPM_MLDSA_65_PUB_SIZE   1952
+#define FWTPM_MLDSA_65_SIG_SIZE   3309
+#define FWTPM_MLDSA_87_PUB_SIZE   2592
+#define FWTPM_MLDSA_87_SIG_SIZE   4627
+#define FWTPM_MLKEM_512_CT_SIZE    768
+#define FWTPM_MLKEM_512_PUB_SIZE   800
+#define FWTPM_MLKEM_768_CT_SIZE   1088
+#define FWTPM_MLKEM_768_PUB_SIZE  1184
+#define FWTPM_MLKEM_1024_CT_SIZE  1568
+#define FWTPM_MLKEM_1024_PUB_SIZE 1568
+
+/* Resolve the largest enabled parameter set for buffer sizing. Driven by
+ * wolfCrypt's WOLFSSL_NO_ML_DSA_44/65/87 and WOLFSSL_NO_KYBER512/768/1024
+ * gates so subset builds (e.g. MLDSA-44 only) don't pay for MLDSA-87. */
+#if defined(WOLFTPM_V185) && !defined(WOLFTPM2_NO_WOLFCRYPT)
+    #if !defined(WOLFSSL_NO_ML_DSA_87)
+        #define FWTPM_MAX_MLDSA_SIG_SIZE  FWTPM_MLDSA_87_SIG_SIZE
+        #define FWTPM_MAX_MLDSA_PUB_SIZE  FWTPM_MLDSA_87_PUB_SIZE
+    #elif !defined(WOLFSSL_NO_ML_DSA_65)
+        #define FWTPM_MAX_MLDSA_SIG_SIZE  FWTPM_MLDSA_65_SIG_SIZE
+        #define FWTPM_MAX_MLDSA_PUB_SIZE  FWTPM_MLDSA_65_PUB_SIZE
+    #elif !defined(WOLFSSL_NO_ML_DSA_44)
+        #define FWTPM_MAX_MLDSA_SIG_SIZE  FWTPM_MLDSA_44_SIG_SIZE
+        #define FWTPM_MAX_MLDSA_PUB_SIZE  FWTPM_MLDSA_44_PUB_SIZE
+    #else
+        #define FWTPM_MAX_MLDSA_SIG_SIZE  0
+        #define FWTPM_MAX_MLDSA_PUB_SIZE  0
+    #endif
+    #if !defined(WOLFSSL_NO_KYBER1024)
+        #define FWTPM_MAX_MLKEM_CT_SIZE   FWTPM_MLKEM_1024_CT_SIZE
+        #define FWTPM_MAX_MLKEM_PUB_SIZE  FWTPM_MLKEM_1024_PUB_SIZE
+    #elif !defined(WOLFSSL_NO_KYBER768)
+        #define FWTPM_MAX_MLKEM_CT_SIZE   FWTPM_MLKEM_768_CT_SIZE
+        #define FWTPM_MAX_MLKEM_PUB_SIZE  FWTPM_MLKEM_768_PUB_SIZE
+    #elif !defined(WOLFSSL_NO_KYBER512)
+        #define FWTPM_MAX_MLKEM_CT_SIZE   FWTPM_MLKEM_512_CT_SIZE
+        #define FWTPM_MAX_MLKEM_PUB_SIZE  FWTPM_MLKEM_512_PUB_SIZE
+    #else
+        #define FWTPM_MAX_MLKEM_CT_SIZE   0
+        #define FWTPM_MAX_MLKEM_PUB_SIZE  0
+    #endif
+#else
+    #define FWTPM_MAX_MLDSA_SIG_SIZE  0
+    #define FWTPM_MAX_MLDSA_PUB_SIZE  0
+    #define FWTPM_MAX_MLKEM_CT_SIZE   0
+    #define FWTPM_MAX_MLKEM_PUB_SIZE  0
+#endif
+
+#ifndef FWTPM_MAX_DATA_BUF
+#define FWTPM_MAX_DATA_BUF     1024  /* HMAC, hash sequences, general data */
+#endif
+#ifndef FWTPM_MAX_PUB_BUF
+    /* Holds the largest serialized public area. PQC pub keys (MLDSA-87
+     * = 2592, MLKEM-1024 = 1568) dominate when enabled. Keep 128 B slack
+     * for TPM2B_PUBLIC headers + alg parameters. */
+    #if FWTPM_MAX_MLDSA_PUB_SIZE > FWTPM_MAX_MLKEM_PUB_SIZE
+        #define FWTPM_MAX_PUB_BUF_RAW  FWTPM_MAX_MLDSA_PUB_SIZE
+    #else
+        #define FWTPM_MAX_PUB_BUF_RAW  FWTPM_MAX_MLKEM_PUB_SIZE
+    #endif
+    #if FWTPM_MAX_PUB_BUF_RAW > 384
+        #define FWTPM_MAX_PUB_BUF  (FWTPM_MAX_PUB_BUF_RAW + 128)
+    #else
+        #define FWTPM_MAX_PUB_BUF  512  /* classical RSA/ECC default */
+    #endif
+#endif
+#ifndef FWTPM_MAX_DER_SIG_BUF
+    /* Holds DER signatures + scratch. PQC dominates when enabled
+     * (MLDSA-87 sig = 4627, MLDSA-65 = 3309, MLDSA-44 = 2420). 128 B slack
+     * for TPM2B_SIGNATURE wrapper. */
+    #if FWTPM_MAX_MLDSA_SIG_SIZE > 128
+        #define FWTPM_MAX_DER_SIG_BUF  (FWTPM_MAX_MLDSA_SIG_SIZE + 128)
+    #else
+        #define FWTPM_MAX_DER_SIG_BUF  256  /* classical DER sig default */
+    #endif
+#endif
+#ifdef WOLFTPM_V185
+/* KEM ciphertext buffer: derived from the largest enabled MLKEM
+ * parameter set (MLKEM-1024 = 1568, MLKEM-768 = 1088, MLKEM-512 = 768).
+ * 64 B slack covers wrapper overhead. */
+#ifndef FWTPM_MAX_KEM_CT_BUF
+    #if FWTPM_MAX_MLKEM_CT_SIZE > 0
+        #define FWTPM_MAX_KEM_CT_BUF   (FWTPM_MAX_MLKEM_CT_SIZE + 64)
+    #else
+        #define FWTPM_MAX_KEM_CT_BUF   256
+    #endif
+#endif
+#endif
+#ifndef FWTPM_MAX_ATTEST_BUF
+#define FWTPM_MAX_ATTEST_BUF   1024  /* Attestation info marshaling */
+#endif
+#define FWTPM_MAX_CMD_AUTHS    3     /* Max auth sessions per command */
+
+/* Symmetric key / HMAC buffer sizes */
+#ifndef FWTPM_MAX_SYM_KEY_SIZE
+#define FWTPM_MAX_SYM_KEY_SIZE     32  /* AES-256 key */
+#endif
+#ifndef FWTPM_MAX_HMAC_KEY_SIZE
+#define FWTPM_MAX_HMAC_KEY_SIZE    64  /* SHA-512 block-size HMAC key */
+#endif
+#ifndef FWTPM_MAX_HMAC_DIGEST_SIZE
+#define FWTPM_MAX_HMAC_DIGEST_SIZE 64  /* SHA-512 output */
+#endif
+
+/* fwTPM firmware revision (TPM_PT_REVISION hundredths) */
+#ifndef FWTPM_REVISION
+#ifdef WOLFTPM_V185
+#define FWTPM_REVISION 185
+#else
+#define FWTPM_REVISION 159
+#endif
+#endif
+
+/* Compile-time build date parsed from __DATE__ ("Mmm DD YYYY") */
+#define FWTPM_BUILD_YEAR \
+    (((__DATE__[7] - '0') * 1000) + ((__DATE__[8] - '0') * 100) + \
+     ((__DATE__[9] - '0') *   10) +  (__DATE__[10] - '0'))
+
+#define FWTPM_BUILD_MONTH ( \
+    (__DATE__[0]=='J' && __DATE__[1]=='a' && __DATE__[2]=='n') ?  1 : \
+    (__DATE__[0]=='F')                                         ?  2 : \
+    (__DATE__[0]=='M' && __DATE__[2]=='r')                     ?  3 : \
+    (__DATE__[0]=='A' && __DATE__[1]=='p')                     ?  4 : \
+    (__DATE__[0]=='M')                                         ?  5 : \
+    (__DATE__[0]=='J' && __DATE__[2]=='n')                     ?  6 : \
+    (__DATE__[0]=='J')                                         ?  7 : \
+    (__DATE__[0]=='A')                                         ?  8 : \
+    (__DATE__[0]=='S')                                         ?  9 : \
+    (__DATE__[0]=='O')                                         ? 10 : \
+    (__DATE__[0]=='N')                                         ? 11 : 12)
+
+#define FWTPM_BUILD_DAY \
+    (((__DATE__[4] == ' ') ? 0 : (__DATE__[4] - '0')) * 10 + \
+     (__DATE__[5] - '0'))
+
+/* Day-of-year (non-leap; sufficient for TPM_PT_DAY_OF_YEAR) */
+#define FWTPM_BUILD_DAY_OF_YEAR ( \
+    FWTPM_BUILD_DAY + \
+    ((FWTPM_BUILD_MONTH >  1) ? 31 : 0) + \
+    ((FWTPM_BUILD_MONTH >  2) ? 28 : 0) + \
+    ((FWTPM_BUILD_MONTH >  3) ? 31 : 0) + \
+    ((FWTPM_BUILD_MONTH >  4) ? 30 : 0) + \
+    ((FWTPM_BUILD_MONTH >  5) ? 31 : 0) + \
+    ((FWTPM_BUILD_MONTH >  6) ? 30 : 0) + \
+    ((FWTPM_BUILD_MONTH >  7) ? 31 : 0) + \
+    ((FWTPM_BUILD_MONTH >  8) ? 31 : 0) + \
+    ((FWTPM_BUILD_MONTH >  9) ? 30 : 0) + \
+    ((FWTPM_BUILD_MONTH > 10) ? 31 : 0) + \
+    ((FWTPM_BUILD_MONTH > 11) ? 30 : 0))
+
+/* PCR banks: 0=SHA-256, 1=SHA-384 (if available) */
+/* PCR bank slot assignments. SHA-256 is mandatory (first bank). SHA-1 and
+ * SHA-384 are conditional on wolfCrypt build options. The bitmap order
+ * matches: bit0=SHA256, bit1=SHA384, bit2=SHA1 — preserves the existing
+ * default allocation value for backward compatibility with NV state v2. */
+#define FWTPM_PCR_BANK_SHA256  0
+#ifdef WOLFSSL_SHA384
+    #define FWTPM_PCR_BANK_SHA384  1
+    #ifndef NO_SHA
+        #define FWTPM_PCR_BANK_SHA1    2
+        #define FWTPM_PCR_BANKS        3
+        /* SHA-256 + SHA-384; SHA-1 not allocated by default per TCG PC
+         * Client guidance (legacy banks may be allocated explicitly). */
+        #define FWTPM_PCR_ALLOC_DEFAULT  0x03
+    #else
+        #define FWTPM_PCR_BANKS        2
+        #define FWTPM_PCR_ALLOC_DEFAULT  0x03
+    #endif
+#else
+    #ifndef NO_SHA
+        #define FWTPM_PCR_BANK_SHA1    1
+        #define FWTPM_PCR_BANKS        2
+        #define FWTPM_PCR_ALLOC_DEFAULT  0x01  /* SHA-256 only by default */
+    #else
+        #define FWTPM_PCR_BANKS        1
+        #define FWTPM_PCR_ALLOC_DEFAULT  0x01  /* SHA-256 only */
+    #endif
+#endif
+
+/* Max digest size we track (SHA-384 = 48 bytes) */
+#ifndef TPM_MAX_DIGEST_SIZE
+#define TPM_MAX_DIGEST_SIZE    64
+#endif
+
+
+/* --- WOLFTPM_SMALL_STACK helpers ---
+ * When WOLFTPM_SMALL_STACK is defined, large stack variables are heap-allocated.
+ * Follows the wolfSSL WC_DECLARE_VAR pattern:
+ *   SMALL_STACK:  declares pointer, ALLOC does XMALLOC, FREE does XFREE
+ *   Normal:       declares array[1], ALLOC/FREE are no-ops
+ *
+ * Usage for struct types (crypto objects, TPM structs):
+ *   FWTPM_DECLARE_VAR(rsaKey, RsaKey);       // declaration
+ *   FWTPM_ALLOC_VAR(rsaKey, RsaKey);         // sets rc=TPM_RC_MEMORY on fail
+ *   wc_InitRsaKey(rsaKey, NULL);             // use as pointer (not &rsaKey)
+ *   FWTPM_FREE_VAR(rsaKey);                  // cleanup (XFREE(NULL) is safe)
+ *
+ * Usage for byte arrays:
+ *   FWTPM_DECLARE_BUF(buf, SIZE);            // declaration
+ *   FWTPM_ALLOC_BUF(buf, SIZE);              // sets rc=TPM_RC_MEMORY on fail
+ *   memcpy(buf, src, len);                   // use as pointer (unchanged)
+ *   FWTPM_FREE_BUF(buf);                     // cleanup
+ */
+#ifdef WOLFTPM_SMALL_STACK
+    #define FWTPM_DECLARE_VAR(name, type) \
+        type* name = NULL
+    #define FWTPM_ALLOC_VAR(name, type) \
+        do { \
+            (name) = (type*)XMALLOC(sizeof(type), NULL, \
+                DYNAMIC_TYPE_TMP_BUFFER); \
+            if ((name) == NULL) { rc = TPM_RC_MEMORY; } \
+        } while (0)
+    /* Allocate AND zero-initialize. Use this when the variable will be
+     * written piecemeal (e.g. parsed from wire) — equivalent to
+     * FWTPM_ALLOC_VAR followed by XMEMSET, but bundled to prevent forgetting
+     * the memset and leaking stack data into the output. */
+    #define FWTPM_CALLOC_VAR(name, type) \
+        do { \
+            (name) = (type*)XMALLOC(sizeof(type), NULL, \
+                DYNAMIC_TYPE_TMP_BUFFER); \
+            if ((name) == NULL) { rc = TPM_RC_MEMORY; } \
+            else { XMEMSET((name), 0, sizeof(type)); } \
+        } while (0)
+    #define FWTPM_FREE_VAR(name) \
+        XFREE(name, NULL, DYNAMIC_TYPE_TMP_BUFFER)
+
+    #define FWTPM_DECLARE_BUF(name, sz) \
+        byte* name = NULL
+    /* Compile-time check: buffer size must be > 8 bytes.
+     * Catches accidental sizeof(pointer) passed as sz. */
+    #define FWTPM_ALLOC_BUF(name, sz) \
+        do { \
+            typedef char _fwtpm_bufchk_##name[((sz) > 8) ? 1 : -1]; \
+            (void)sizeof(_fwtpm_bufchk_##name); \
+            (name) = (byte*)XMALLOC((sz), NULL, \
+                DYNAMIC_TYPE_TMP_BUFFER); \
+            if ((name) == NULL) { rc = TPM_RC_MEMORY; } \
+        } while (0)
+    /* Allocate AND zero-initialize byte buffer. */
+    #define FWTPM_CALLOC_BUF(name, sz) \
+        do { \
+            typedef char _fwtpm_bufchk_##name[((sz) > 8) ? 1 : -1]; \
+            (void)sizeof(_fwtpm_bufchk_##name); \
+            (name) = (byte*)XMALLOC((sz), NULL, \
+                DYNAMIC_TYPE_TMP_BUFFER); \
+            if ((name) == NULL) { rc = TPM_RC_MEMORY; } \
+            else { XMEMSET((name), 0, (sz)); } \
+        } while (0)
+    #define FWTPM_FREE_BUF(name) \
+        XFREE(name, NULL, DYNAMIC_TYPE_TMP_BUFFER)
+
+    /* Use instead of sizeof(buf) — sizeof(pointer) is wrong under SMALL_STACK.
+     * The sz argument must match the size passed to FWTPM_DECLARE_BUF. */
+    #define FWTPM_SIZEOF_BUF(name, sz) (sz)
+#else
+    #define FWTPM_DECLARE_VAR(name, type) \
+        type name[1]
+    #define FWTPM_ALLOC_VAR(name, type) do { } while (0)
+    #define FWTPM_CALLOC_VAR(name, type) \
+        XMEMSET((name), 0, sizeof(type))
+    #define FWTPM_FREE_VAR(name) do { } while (0)
+
+    #define FWTPM_DECLARE_BUF(name, sz) \
+        byte name[(sz)]
+    #define FWTPM_ALLOC_BUF(name, sz) do { } while (0)
+    #define FWTPM_CALLOC_BUF(name, sz) \
+        XMEMSET((name), 0, (sz))
+    #define FWTPM_FREE_BUF(name) do { } while (0)
+
+    #define FWTPM_SIZEOF_BUF(name, sz) sizeof(name)
+#endif
+
+/* Transient object slot */
+typedef struct FWTPM_Object {
+    int used;
+    TPM_HANDLE handle;              /* 0x80xxxxxx transient handle */
+    UINT32 hierarchy;               /* TPM_RH_OWNER/ENDORSEMENT/PLATFORM/NULL —
+                                     * required for ticket HMAC proofValue
+                                     * lookup per Part 2 Sec.10.6.5 Eq (5) */
+    TPMT_PUBLIC pub;                /* Public area */
+    TPM2B_AUTH authValue;           /* Object auth */
+    byte privKey[FWTPM_MAX_PRIVKEY_DER]; /* DER-encoded private key */
+    int privKeySize;
+    TPM2B_NAME name;                /* Object name = nameAlg || H(publicArea) */
+} FWTPM_Object;
+
+/* Hash sequence slot (for HashSequenceStart/SequenceUpdate/SequenceComplete) */
+typedef struct FWTPM_HashSeq {
+    int used;
+    TPM_HANDLE handle;              /* Sequence handle (0x80xxxxxx) */
+    TPMI_ALG_HASH hashAlg;         /* Hash algorithm for this sequence */
+    int isHmac;                     /* 1 if HMAC sequence, 0 if plain hash */
+    TPM2B_AUTH authValue;           /* Sequence auth (from HashSequenceStart) */
+    UINT16 hmacKeySz;
+    byte hmacKey[MAX_SYM_DATA];
+#ifndef WOLFTPM2_NO_WOLFCRYPT
+    union {
+        wc_HashAlg hash;            /* wolfCrypt hash context (isHmac == 0) */
+        Hmac hmac;                  /* wolfCrypt HMAC context (isHmac == 1) */
+    } ctx;
+#endif
+} FWTPM_HashSeq;
+
+/* Guarded on WOLFTPM_MLDSA, not WOLFTPM_V185: a lean WOLFTPM_PQC build defines
+ * WOLFTPM_MLDSA on its own, and every consumer of these slots tests
+ * WOLFTPM_MLDSA. */
+#ifdef WOLFTPM_MLDSA
+/* ML-DSA sign/verify sequence slot (v1.85 Part 3 Sec.17.5, Sec.17.6).
+ * Pure ML-DSA streams its SHAKE256 mu calculation through hashCtx. */
+typedef struct FWTPM_SignSeq {
+    int used;
+    TPM_HANDLE handle;              /* Sequence handle (0x80xxxxxx) */
+    int isVerifySeq;                /* 0 = sign, 1 = verify */
+    TPM_HANDLE keyHandle;           /* Key used at SequenceStart */
+    TPM2B_NAME keyName;             /* Key's computed name at Start time —
+                                     * binds the sequence to an immutable
+                                     * key identity so a Flush + reload of
+                                     * a different key on the same numeric
+                                     * handle is detected at Complete. */
+    TPM_ALG_ID sigScheme;           /* TPM_ALG_MLDSA / TPM_ALG_HASH_MLDSA */
+    TPMI_ALG_HASH hashAlg;          /* Hash alg for Hash-ML-DSA sequences */
+    TPM2B_AUTH authValue;
+    TPM2B_SIGNATURE_CTX context;
+    int oneShot;                    /* SequenceUpdate not permitted if set */
+    /* Reserved raw-message fields retained in the sequence context layout. */
+    byte   msgBuf[FWTPM_MAX_DATA_BUF];
+    UINT32 msgBufSz;
+    /* First 4 bytes of the assembled message (any path: SequenceUpdate or
+     * SignSequenceComplete trailing buffer). Used for the restricted-key
+     * TPM_GENERATED_VALUE check at Complete time per Part 3 Sec.20.6.1 —
+     * Hash-ML-DSA Update bytes flow into hashCtx and are unrecoverable
+     * otherwise, so the prefix must be captured at Update time. */
+    byte   firstBytes[4];
+    UINT32 firstBytesSz;
+#ifndef WOLFTPM2_NO_WOLFCRYPT
+    /* Hash accumulator for Hash-ML-DSA / classical RSA-ECC sequences. */
+    wc_HashAlg hashCtx;
+    int hashCtxInit;                /* 1 when hashCtx is live */
+    /* HMAC accumulator for KEYEDHASH (HMAC) signing/verifying sequences. */
+    Hmac hmacCtx;
+    int hmacCtxInit;                /* 1 when hmacCtx is live */
+    UINT16 hmacKeySz;
+    byte hmacKey[MAX_SYM_DATA];
+    /* Incremental MESSAGE_VERIFIED ticket HMAC for verify sequences. */
+    Hmac ticketHmacCtx;
+    int ticketHmacCtxInit;
+    UINT32 ticketHierarchy;
+#endif
+} FWTPM_SignSeq;
+
+#ifndef FWTPM_MAX_SIGN_SEQ
+#define FWTPM_MAX_SIGN_SEQ 4
+#endif
+#endif /* WOLFTPM_MLDSA */
+
+/* Auth session slot */
+typedef struct FWTPM_Session {
+    int used;
+    TPM_HANDLE handle;              /* 0x02xxxxxx HMAC, 0x03xxxxxx Policy */
+    TPM_SE sessionType;             /* TPM_SE_HMAC, TPM_SE_POLICY, TPM_SE_TRIAL */
+    TPMI_ALG_HASH authHash;         /* Hash algorithm for this session */
+    TPMT_SYM_DEF symmetric;         /* Symmetric alg for param encryption */
+    TPM2B_NONCE nonceTPM;           /* TPM-generated nonce */
+    TPM2B_NONCE nonceCaller;        /* Last caller nonce received */
+    TPM2B_AUTH sessionKey;          /* Session HMAC key (from KDFa) */
+    TPM2B_AUTH bindAuth;            /* Auth of bound entity */
+    TPM_HANDLE bindHandle;          /* Bound entity handle (0 if unbound) */
+#ifndef FWTPM_NO_DA
+    int isDaBound;                  /* Bound authValue has DA protection */
+    int isLockoutBound;             /* Bound to the lockout hierarchy */
+#endif
+    TPM2B_DIGEST policyDigest;      /* Running policy digest (policy sessions) */
+    int isPasswordPolicy;           /* 1 if PolicyPassword was called */
+    int isAuthValuePolicy;          /* 1 if PolicyAuthValue was called */
+    TPM2B_DIGEST cpHashA;           /* PolicyCpHash: locked once set */
+    TPM2B_DIGEST nameHash;          /* PolicyNameHash: locked once set */
+    int isPPRequired;               /* PolicyPhysicalPresence flag */
+    int requiredLocality;           /* PolicyLocality bitmap */
+    int hasRequiredLocality;        /* 1 once PolicyLocality has been called */
+    UINT32 commandCode;             /* PolicyCommandCode/DuplicationSelect: locked once set */
+    TPM2B_DIGEST templateHash;      /* PolicyTemplate: locked once set */
+    int checkNvWritten;             /* 1 once PolicyNvWritten has been called */
+    int nvWrittenState;             /* PolicyNvWritten writtenSet */
+    UINT32 pcrUpdateCounter;        /* PCR update counter seen by PolicyPCR */
+    int hasPcrUpdateCounter;        /* 1 once PolicyPCR has been evaluated */
+} FWTPM_Session;
+
+/* NV index slot (user NV RAM) */
+typedef struct FWTPM_NvIndex {
+    int inUse;
+    TPMS_NV_PUBLIC nvPublic;            /* Public attributes and metadata */
+    TPM2B_AUTH authValue;               /* NV index auth (password) */
+    byte           data[FWTPM_MAX_NV_DATA]; /* NV data contents */
+    int            written;             /* Has any data been written? */
+} FWTPM_NvIndex;
+
+/* Cached primary key (for seed-deterministic CreatePrimary behavior) */
+typedef struct FWTPM_PrimaryCache {
+    int used;
+    TPM_HANDLE hierarchy;               /* Owner/Endorsement/Platform/Null */
+    byte templateHash[WC_SHA256_DIGEST_SIZE]; /* SHA-256 of inPublic */
+    TPMT_PUBLIC pub;                     /* Generated public area */
+    byte privKey[FWTPM_MAX_PRIVKEY_DER]; /* DER-encoded private key */
+    int privKeySize;
+} FWTPM_PrimaryCache;
+
+/* IO transport HAL callbacks — socket transport only (not used in TIS mode) */
+#ifndef WOLFTPM_FWTPM_TIS
+typedef struct FWTPM_IO_HAL_S {
+    /* Send data to client. Returns 0 on success. */
+    int (*send)(void* ctx, const void* buf, int sz);
+    /* Receive data from client. Returns 0 on success. */
+    int (*recv)(void* ctx, void* buf, int sz);
+    /* Wait for connections/data. Returns bitmask:
+     * 0x01 = command data ready, 0x02 = platform data ready,
+     * 0x04 = new command connection, 0x08 = new platform connection.
+     * Negative on error. */
+    int (*wait)(void* ctx);
+    /* Accept a new connection (for connection-oriented transports).
+     * type: 0=command, 1=platform. Returns 0 on success. */
+    int (*accept)(void* ctx, int type);
+    /* Close a connection. type: 0=command, 1=platform. */
+    void (*close_conn)(void* ctx, int type);
+    /* User context (e.g., socket fds, SPI handle, etc.) */
+    void* ctx;
+} FWTPM_IO_HAL;
+
+/* IO context for socket transport (default) */
+#ifdef _WIN32
+    #define FWTPM_INVALID_FD INVALID_SOCKET
+#else
+    #define FWTPM_INVALID_FD (-1)
+#endif
+typedef struct FWTPM_IO_CTX {
+    SOCKET_T listenFd;       /* Listening socket for command port */
+    SOCKET_T platListenFd;   /* Listening socket for platform port */
+    SOCKET_T clientFd;       /* Accepted client connection */
+    SOCKET_T platClientFd;   /* Accepted platform client connection */
+} FWTPM_IO_CTX;
+#endif /* !WOLFTPM_FWTPM_TIS */
+
+/* NV HAL callbacks - defined at file scope (not nested in FWTPM_CTX) so it
+ * is portable across C and C++. FWTPM_NV_HAL is the typedef alias (see
+ * fwtpm_nv.h). */
+struct FWTPM_NV_HAL_S {
+    int (*read)(void* ctx, word32 offset, byte* buf, word32 size);
+    /* Must return non-zero only if the bytes are not durable: a state change
+     * whose write fails is rolled back and reported as failed. */
+    int (*write)(void* ctx, word32 offset, const byte* buf, word32 size);
+    int (*erase)(void* ctx, word32 offset, word32 size); /* Optional */
+    void* ctx;
+    word32 maxSize;     /* Total NV region size */
+    /* Override the NV-journal integrity key with a platform device secret
+     * (e.g. hardware-fused or host-TPM backed). Return 0 and set *keySz on
+     * success. When NULL the default file backend uses an auto-created key
+     * file; integrity verification is always performed when a key exists. */
+    int (*get_integrity_key)(void* ctx, byte* key, word32* keySz);
+    /* Program granule in bytes for append-only flash (0/1 = byte-writable). */
+    word32 writeAlign;
+    /* Append-only (write-once flash) mode; needs WOLFTPM_FWTPM_NV_APPEND_ONLY.
+     * Remaining bits reserved. */
+    unsigned int appendOnly : 1;
+};
+
+/* Clock HAL callbacks (optional - if not set, clockOffset used directly) */
+struct FWTPM_CLOCK_HAL_S {
+    UINT64 (*get_ms)(void* ctx);  /* Return milliseconds since boot */
+    void* ctx;
+};
+
+#ifndef FWTPM_NO_PP
+/* Physical-presence HAL. get_pp returns non-zero when the platform's physical
+ * presence signal is currently asserted. It is wired by the integrator to a
+ * hardware line or latched platform state, never to the command channel, so a
+ * remote caller cannot assert it. When get_pp is NULL, physical presence is
+ * treated as absent and any PP-requiring authorization fails closed. */
+struct FWTPM_PP_HAL_S {
+    int (*get_pp)(void* ctx);
+    void* ctx;
+};
+#endif /* !FWTPM_NO_PP */
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+/* Max append-only program granule; sizes the pending-granule buffer. */
+#ifndef FWTPM_NV_MAX_WRITE_ALIGN
+#define FWTPM_NV_MAX_WRITE_ALIGN 64
+#endif
+#endif
+
+/* fwTPM context - holds all TPM state */
+typedef struct FWTPM_CTX {
+    volatile int running;       /* Server running flag (volatile for signal handler) */
+
+#ifndef WOLFTPM_FWTPM_TIS
+    /* Socket transport configuration (not used in TIS mode) */
+    int cmdPort;                /* Command port (default 2321) */
+    int platPort;               /* Platform port (default 2322) */
+    FWTPM_IO_HAL ioHal;        /* IO transport HAL callbacks */
+    FWTPM_IO_CTX io;            /* Socket IO state */
+#endif
+
+    /* Command/Response buffers */
+    byte cmdBuf[FWTPM_MAX_COMMAND_SIZE];
+    byte rspBuf[FWTPM_MAX_COMMAND_SIZE];
+
+    /* TPM state */
+    int powerOn;
+    int wasStarted;             /* Has TPM2_Startup been called */
+    int pendingClear;           /* Deferred clear (after response auth) */
+    int disableClear;           /* ClearControl: 1 = Clear is disabled */
+    int globalNvWriteLock;      /* NV_GlobalWriteLock (reset on Startup CLEAR) */
+    /* HierarchyControl enable state (0 = enabled). Re-enabled on Startup
+     * CLEAR per TPM 2.0 Part 1 (TPMS_STARTUP_CLEAR). */
+    int shDisabled;             /* !shEnable:   owner hierarchy */
+    int ehDisabled;             /* !ehEnable:   endorsement hierarchy */
+    int phDisabled;             /* !phEnable:   platform hierarchy */
+    int phNvDisabled;           /* !phEnableNV: platform NV indices */
+#ifndef FWTPM_NO_DA
+    /* Dictionary Attack protection state */
+    UINT32 daFailedTries;       /* Failed auth count, persisted in NV */
+    UINT32 daMaxTries;          /* Threshold before lockout (default 32) */
+    UINT32 daRecoveryTime;      /* Seconds to decrement failedTries */
+    UINT32 daLockoutRecovery;   /* Seconds to fully recover. 0=reboot only */
+    UINT64 daSelfHealMs;        /* Clock ms baseline for failedTries self-heal */
+    UINT64 daLockoutHealMs;     /* Clock ms when lockoutAuthFailed was set */
+    int daUsed;                 /* DA-protected auth used this boot (volatile) */
+    int orderly;                /* 1 = last NV checkpoint was clean (persisted) */
+    int lockoutAuthFailed;      /* lockoutAuth lock; persisted (reboot-clears
+                                 * only when clockless or lockoutRecovery==0) */
+#endif
+    int activeLocality;         /* locality of the command being processed */
+#ifndef FWTPM_NO_PP
+    int physicalPresence;       /* Platform-channel PP latch (volatile). Only
+                                 * consulted when no PP HAL is registered. */
+#endif
+    UINT64 clockOffset;         /* Clock offset set by ClockSet */
+    UINT32 resetCount;          /* TPM Reset count, persisted across boots */
+    UINT32 restartCount;        /* TPM Restart/Resume count, volatile */
+
+    /* PCR state: [pcrIndex][bank][digest bytes] */
+    byte pcrDigest[IMPLEMENTATION_PCR][FWTPM_PCR_BANKS][TPM_MAX_DIGEST_SIZE];
+    UINT32 pcrUpdateCounter;
+
+    /* Per-PCR auth values (set by PCR_SetAuthValue) */
+    TPM2B_AUTH pcrAuth[IMPLEMENTATION_PCR];
+    /* Per-PCR auth policies (set by PCR_SetAuthPolicy) */
+    TPM2B_DIGEST pcrPolicy[IMPLEMENTATION_PCR];
+    TPMI_ALG_HASH pcrPolicyAlg[IMPLEMENTATION_PCR];
+    /* PCR bank allocation (bitmap: bit 0=SHA-256, bit 1=SHA-384) */
+    UINT8 pcrAllocatedBanks; /* default: 0x03 = both banks */
+
+    /* Transient object slots */
+    FWTPM_Object objects[FWTPM_MAX_OBJECTS];
+
+    /* Primary key cache: ensures CreatePrimary is deterministic per seed */
+    FWTPM_PrimaryCache primaryCache[FWTPM_MAX_PRIMARY_CACHE];
+
+    /* Persistent object slots (0x81xxxxxx handles via EvictControl) */
+    FWTPM_Object persistent[FWTPM_MAX_PERSISTENT];
+
+    /* NV index slots (0x01xxxxxx handles) */
+    FWTPM_NvIndex nvIndices[FWTPM_MAX_NV_INDICES];
+
+    /* Hash sequence slots */
+#ifndef FWTPM_NO_HASH_CMDS
+    FWTPM_HashSeq hashSeq[FWTPM_MAX_HASH_SEQ];
+#endif
+#ifdef WOLFTPM_MLDSA
+    FWTPM_SignSeq signSeq[FWTPM_MAX_SIGN_SEQ];
+#endif
+
+    /* Auth session slots */
+    FWTPM_Session sessions[FWTPM_MAX_SESSIONS];
+
+    /* Hierarchy seeds (generated once, persisted in NV) */
+    byte ownerSeed[TPM_SHA384_DIGEST_SIZE];
+    byte endorsementSeed[TPM_SHA384_DIGEST_SIZE];
+    byte platformSeed[TPM_SHA384_DIGEST_SIZE];
+    byte nullSeed[TPM_SHA384_DIGEST_SIZE];
+
+    /* Hierarchy auth values */
+    TPM2B_AUTH ownerAuth;
+    TPM2B_AUTH endorsementAuth;
+    TPM2B_AUTH platformAuth;
+    TPM2B_AUTH lockoutAuth;
+
+    /* Hierarchy auth policies (set by SetPrimaryPolicy) */
+    TPM2B_DIGEST ownerPolicy;
+    TPMI_ALG_HASH ownerPolicyAlg;
+    TPM2B_DIGEST endorsementPolicy;
+    TPMI_ALG_HASH endorsementPolicyAlg;
+    TPM2B_DIGEST platformPolicy;
+    TPMI_ALG_HASH platformPolicyAlg;
+    TPM2B_DIGEST lockoutPolicy;
+    TPMI_ALG_HASH lockoutPolicyAlg;
+
+#ifndef FWTPM_NO_CONTEXT
+    /* Per-boot context protection key (volatile only, never persisted).
+     * Used by ContextSave/ContextLoad for HMAC + AES-CFB protection of
+     * session context blobs per TPM 2.0 Part 1 Sec.30. */
+    byte ctxProtectKey[AES_256_KEY_SIZE];
+    int  ctxProtectKeyValid;
+#endif
+
+    /* TIS transport state (when not using sockets) */
+#ifdef WOLFTPM_FWTPM_TIS
+    FWTPM_TIS_HAL  tisHal;      /* Transport HAL callbacks */
+    FWTPM_TIS_REGS* tisRegs;    /* Pointer to register state */
+#endif
+
+    /* NV HAL callbacks */
+    struct FWTPM_NV_HAL_S nvHal;
+
+    /* Clock HAL callbacks (optional - if not set, clockOffset used directly) */
+    struct FWTPM_CLOCK_HAL_S clockHal;
+
+#ifndef FWTPM_NO_PP
+    /* Physical-presence HAL (optional). When unset, PP is never asserted. */
+    struct FWTPM_PP_HAL_S ppHal;
+#endif
+
+    /* NV journal write position (next append offset) */
+    word32 nvWritePos;
+    int nvCompacting;   /* Guard flag to prevent cyclic recursion during NV compaction */
+    UINT32 nvDeleteHandle; /* Item a pending deletion omits from compaction */
+
+#ifdef WOLFTPM_FWTPM_NV_APPEND_ONLY
+    /* Append-only pending program granule (word-backed for alignment; element
+     * count rounded up so an odd FWTPM_NV_MAX_WRITE_ALIGN override still fits). */
+    word32 nvGranule[(FWTPM_NV_MAX_WRITE_ALIGN + sizeof(word32) - 1)
+        / sizeof(word32)];
+    word32 nvGranuleBase;   /* aligned offset of the pending granule */
+    word32 nvGranuleFill;   /* bytes buffered (0..writeAlign) */
+    int nvRebuild;          /* an unsealed append is on the log: NV refuses
+                             * mutations until a restart compacts it away */
+#endif
+
+#ifndef FWTPM_NO_CONTEXT
+    /* ContextSave sequence counter (monotonic, reset on init) */
+    UINT64 contextSeqCounter;
+    /* Live (saved-but-not-yet-loaded) context sequences. A context loads at
+     * most once and saved contexts may load in any order. */
+    UINT64 contextLive[FWTPM_MAX_OBJECTS + FWTPM_MAX_SESSIONS];
+    int contextLiveCount;
+#endif
+
+    /* Set once TPM2_SelfTest has completed successfully */
+    int selfTestRun;
+
+#if defined(HAVE_ECC) && !defined(FWTPM_NO_ECDH)
+    /* EC_Ephemeral commit counter and key storage (volatile). Only the ECDH
+     * command group (EC_Ephemeral / ZGen_2Phase) uses this state. */
+    UINT16 ecEphemeralCounter;
+    byte ecEphemeralKey[FWTPM_MAX_PRIVKEY_DER];
+    int ecEphemeralKeySz;
+    UINT16 ecEphemeralCurve;
+#endif
+
+    /* wolfCrypt RNG */
+#ifndef WOLFTPM2_NO_WOLFCRYPT
+    WC_RNG rng;
+#endif
+
+#ifdef WOLFTPM_SPDM_RESPONDER
+    /* Bit 0 = TCG, bit 1 = PSK. Zero disables SPDM at runtime. */
+    int spdmMode;
+    struct WOLFSPDM_RESP_CTX* spdmRespCtx;
+#endif
+
+#ifdef WOLFTPM_FWTPM_TIS
+    /* TIS transport: locality that currently owns the interface (ACCESS active
+     * locality); 0-4 = owner, -1 = none. TIS layer only. */
+    int tisLocality;
+#endif
+
+#ifndef FWTPM_NO_NV
+    /* Transient authorization methods for the command being dispatched. */
+    byte activeCmdAuthIsPolicy[FWTPM_MAX_CMD_AUTHS];
+#endif
+} FWTPM_CTX;
+
+/* fwTPM SPDM mode bits - used with FWTPM_CTX.spdmMode. */
+#define FWTPM_SPDM_MODE_OFF   0x00
+#define FWTPM_SPDM_MODE_TCG   0x01
+#define FWTPM_SPDM_MODE_PSK   0x02
+
+/** @defgroup wolfTPM_fwTPM wolfTPM fwTPM (Firmware TPM)
+ *
+ * Public API for the wolfTPM firmware TPM (fwTPM) software TPM 2.0
+ * implementation. fwTPM is a portable TPM server that speaks the
+ * TCG TPM 2.0 command protocol and can run alongside or in place of
+ * a hardware TPM. Transports are pluggable (sockets, TIS shared memory,
+ * SPI/UART on embedded targets) via HAL callbacks. Storage (NV) and
+ * clock are also pluggable so the same core can run on Linux and
+ * bare-metal microcontrollers.
+ */
+
+/*!
+    \ingroup wolfTPM_fwTPM
+    \brief Initialize a fwTPM context. Seeds the RNG, clears TPM state,
+    and prepares the context for FWTPM_NV_Init / FWTPM_IO_Init.
+
+    \return 0 on success
+    \return TPM_RC_MEMORY if RNG initialization fails
+
+    \param ctx pointer to caller-allocated FWTPM_CTX (must be zeroed)
+
+    \sa FWTPM_Cleanup
+    \sa FWTPM_NV_SetHAL
+    \sa FWTPM_Clock_SetHAL
+*/
+WOLFTPM_API int FWTPM_Init(FWTPM_CTX* ctx);
+
+/*!
+    \ingroup wolfTPM_fwTPM
+    \brief Release resources held by a fwTPM context. Zeros all
+    hierarchy seeds, session keys, and sensitive auth values before
+    freeing. Safe to call on a partially-initialized context.
+
+    \return 0 on success
+
+    \param ctx pointer to an initialized FWTPM_CTX
+
+    \sa FWTPM_Init
+*/
+WOLFTPM_API int FWTPM_Cleanup(FWTPM_CTX* ctx);
+
+/*!
+    \ingroup wolfTPM_fwTPM
+    \brief Return a pointer to the compile-time fwTPM version string
+    (e.g. "0.1.0").
+
+    \return pointer to a static, null-terminated version string
+*/
+WOLFTPM_API const char* FWTPM_GetVersionString(void);
+
+/*!
+    \ingroup wolfTPM_fwTPM
+    \brief Register a platform clock source for fwTPM. On embedded
+    targets this allows the TPM clock (TPM2_ReadClock / TPM2_ClockSet)
+    to advance from a hardware timer. When no HAL is registered,
+    FWTPM_Clock_GetMs returns ctx->clockOffset only.
+
+    \return 0 on success
+    \return BAD_FUNC_ARG if ctx or get_ms is NULL
+
+    \param ctx pointer to an initialized FWTPM_CTX
+    \param get_ms callback returning milliseconds-since-boot; must be
+        non-NULL, or the call returns BAD_FUNC_ARG
+    \param halCtx opaque context passed back to get_ms
+
+    \sa FWTPM_Clock_GetMs
+*/
+WOLFTPM_API int FWTPM_Clock_SetHAL(FWTPM_CTX* ctx,
+    UINT64 (*get_ms)(void* halCtx), void* halCtx);
+
+/*!
+    \ingroup wolfTPM_fwTPM
+    \brief Get the current TPM clock value in milliseconds. Returns
+    ctx->clockOffset plus (if registered) the value from the clock HAL.
+
+    \return current clock value in milliseconds
+    \return 0 if ctx is NULL
+
+    \param ctx pointer to an initialized FWTPM_CTX
+
+    \sa FWTPM_Clock_SetHAL
+*/
+WOLFTPM_API UINT64 FWTPM_Clock_GetMs(FWTPM_CTX* ctx);
+
+/*!
+    \ingroup wolfTPM_fwTPM
+    \brief Register the physical-presence HAL. get_pp must return non-zero only
+    while the platform's physical presence signal is asserted, driven by
+    hardware or latched platform state and never by the command channel. With
+    no HAL registered, physical presence is treated as absent and every
+    PP-requiring authorization fails closed.
+
+    \return 0 on success
+    \return BAD_FUNC_ARG if ctx is NULL
+
+    \param ctx pointer to an initialized FWTPM_CTX
+    \param get_pp callback returning non-zero when PP is asserted; may be NULL
+        to clear a previously registered HAL
+    \param halCtx opaque context passed back to get_pp
+*/
+#ifndef FWTPM_NO_PP
+WOLFTPM_API int FWTPM_PP_SetHAL(FWTPM_CTX* ctx,
+    int (*get_pp)(void* halCtx), void* halCtx);
+#endif
+
+#ifdef __cplusplus
+    }  /* extern "C" */
+#endif
+
+#endif /* WOLFTPM_FWTPM */
+
+#endif /* _FWTPM_H_ */

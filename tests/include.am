@@ -1,0 +1,58 @@
+# vim:ft=automake
+# included from Top Level Makefile.am
+# All paths should be given relative to the root
+
+# unit.test requires a running TPM server. When fwtpm_check.sh is used
+# (BUILD_FWTPM), it manages the server and runs unit.test internally —
+# so exclude unit.test from check_PROGRAMS in that case.
+if BUILD_EXAMPLES
+if !BUILD_FWTPM
+check_PROGRAMS += tests/unit.test
+endif
+noinst_PROGRAMS += tests/unit.test
+tests_unit_test_SOURCES      = tests/unit_tests.c \
+                               examples/tpm_test_keys.c \
+                               examples/firmware/st33_blob0.c
+tests_unit_test_CFLAGS       = $(AM_CFLAGS)
+tests_unit_test_LDADD        = src/libwolftpm.la $(LIB_STATIC_ADD)
+tests_unit_test_DEPENDENCIES = src/libwolftpm.la
+endif
+
+if BUILD_FWTPM
+check_PROGRAMS += tests/fwtpm_unit.test
+noinst_PROGRAMS += tests/fwtpm_unit.test
+tests_fwtpm_unit_test_SOURCES = \
+    tests/fwtpm_unit_tests.c \
+    src/fwtpm/fwtpm.c \
+    src/fwtpm/fwtpm_command.c \
+    src/fwtpm/fwtpm_crypto.c \
+    src/fwtpm/fwtpm_nv.c \
+    src/tpm2_util.c \
+    src/tpm2_packet.c \
+    src/tpm2_crypto.c \
+    src/tpm2_param_enc.c
+tests_fwtpm_unit_test_CFLAGS   = -DWOLFTPM_FWTPM -DFWTPM_NV_FILE=\"fwtpm_test_nv.bin\" $(AM_CFLAGS)
+tests_fwtpm_unit_test_CPPFLAGS = \
+    -DWOLFTPM_FWTPM -DWOLFTPM_FWTPM_UNIT_TEST $(AM_CPPFLAGS)
+tests_fwtpm_unit_test_LDADD    = $(LIB_STATIC_ADD)
+endif
+
+if BUILD_FWTPM_TIS
+check_PROGRAMS += tests/fwtpm_hal_unit.test
+noinst_PROGRAMS += tests/fwtpm_hal_unit.test
+tests_fwtpm_hal_unit_test_SOURCES = tests/fwtpm_hal_unit_tests.c
+tests_fwtpm_hal_unit_test_CFLAGS = \
+    -DWOLFTPM_FWTPM_HAL -DWOLFTPM_ADV_IO -DWOLFTPM_EXAMPLE_HAL $(AM_CFLAGS)
+tests_fwtpm_hal_unit_test_CPPFLAGS = \
+    -DWOLFTPM_FWTPM_HAL -DWOLFTPM_ADV_IO -DWOLFTPM_EXAMPLE_HAL $(AM_CPPFLAGS)
+tests_fwtpm_hal_unit_test_LDADD = $(FWTPM_TIS_LIBS)
+endif
+
+# TPM make check: manages server, runs unit.test + run_examples.sh
+# Used for --enable-fwtpm builds
+if BUILD_FWTPM
+dist_noinst_SCRIPTS += tests/fwtpm_check.sh \
+                       tests/fwtpm_da_retry.sh
+endif
+
+EXTRA_DIST += tests/pqc_kat_vectors.h

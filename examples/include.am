@@ -1,0 +1,31 @@
+# vim:ft=automake
+# All paths should be given relative to the root
+
+include examples/native/include.am
+include examples/wrap/include.am
+include examples/bench/include.am
+include examples/boot/include.am
+include examples/tls/include.am
+include examples/csr/include.am
+include examples/pkcs7/include.am
+include examples/timestamp/include.am
+include examples/pcr/include.am
+include examples/management/include.am
+include examples/keygen/include.am
+include examples/nvram/include.am
+include examples/gpio/include.am
+include examples/seal/include.am
+include examples/attestation/include.am
+include examples/firmware/include.am
+include examples/endorsement/include.am
+include examples/spdm/include.am
+include examples/pqc/include.am
+
+if BUILD_EXAMPLES
+EXTRA_DIST += examples/run_examples.sh
+endif
+
+dist_example_DATA+= examples/README.md \
+                    examples/tpm_test_keys.c \
+                    examples/tpm_test_keys.h \
+                    examples/tpm_test.h

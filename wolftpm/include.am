@@ -1,0 +1,35 @@
+# vim:ft=automake
+# All paths should be given relative to the root
+#
+
+nobase_include_HEADERS+= \
+                         wolftpm/tpm2.h \
+                         wolftpm/tpm2_packet.h \
+                         wolftpm/tpm2_tis.h \
+                         wolftpm/tpm2_types.h \
+                         wolftpm/tpm2_wrap.h \
+                         wolftpm/tpm2_linux.h \
+                         wolftpm/tpm2_swtpm.h \
+                         wolftpm/tpm2_winapi.h \
+                         wolftpm/tpm2_param_enc.h \
+                         wolftpm/tpm2_crypto.h \
+                         wolftpm/tpm2_socket.h \
+                         wolftpm/tpm2_asn.h \
+                         wolftpm/version.h \
+                         wolftpm/tpm2_spdm.h \
+                         wolftpm/visibility.h \
+                         wolftpm/options.h \
+                         wolftpm/spdm/spdm.h \
+                         wolftpm/spdm/spdm_types.h \
+                         wolftpm/spdm/spdm_error.h \
+                         wolftpm/spdm/spdm_tcg.h \
+                         wolftpm/spdm/spdm_nuvoton.h \
+                         wolftpm/spdm/spdm_nations.h \
+                         wolftpm/spdm/spdm_psk.h \
+                         wolftpm/spdm/spdm_responder.h \
+                         wolftpm/fwtpm/fwtpm.h \
+                         wolftpm/fwtpm/fwtpm_io.h \
+                         wolftpm/fwtpm/fwtpm_command.h \
+                         wolftpm/fwtpm/fwtpm_crypto.h \
+                         wolftpm/fwtpm/fwtpm_nv.h \
+                         wolftpm/fwtpm/fwtpm_tis.h
