@@ -220,6 +220,10 @@ CMD_TEST(cmd_test_wolftpm_clear, 0);
  */
 static int cmd_test_wolftpm_pcr_read(struct unit_test_state *uts)
 {
+	/* The sandbox TPM emulator returns a simplified PCR_Read response */
+	if (IS_ENABLED(CONFIG_SANDBOX))
+		return -EAGAIN;
+
 	/* First autostart to ensure TPM is ready */
 	ut_assertok(run_command("tpm2 autostart", 0));
 
@@ -277,6 +281,10 @@ CMD_TEST(cmd_test_wolftpm_pcr_print, 0);
  */
 static int cmd_test_wolftpm_pcr_allocate(struct unit_test_state *uts)
 {
+	/* The sandbox TPM emulator does not implement PCR_Allocate */
+	if (IS_ENABLED(CONFIG_SANDBOX))
+		return -EAGAIN;
+
 	/* First autostart to ensure TPM is ready */
 	ut_assertok(run_command("tpm2 autostart", 0));
 
@@ -294,6 +302,10 @@ CMD_TEST(cmd_test_wolftpm_pcr_allocate, 0);
  */
 static int cmd_test_wolftpm_dam_reset(struct unit_test_state *uts)
 {
+	/* The sandbox TPM emulator does not implement DictionaryAttackLockReset */
+	if (IS_ENABLED(CONFIG_SANDBOX))
+		return -EAGAIN;
+
 	/* First autostart to ensure TPM is ready */
 	ut_assertok(run_command("tpm2 autostart", 0));
 
