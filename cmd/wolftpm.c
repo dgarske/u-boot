@@ -24,6 +24,7 @@
 /* U-boot specific includes */
 #include <command.h>
 #include <tpm-common.h>
+#include "tpm-user-utils.h"
 #include <vsprintf.h>
 #include <mapmem.h>
 #include <env.h>
@@ -68,7 +69,7 @@ int do_tpm2_device(struct cmd_tbl *cmdtp, int flag,
 				   caps.mfgStr, caps.vendorStr,
 				   caps.fwVerMajor, caps.fwVerMinor);
 		}
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 	}
 
 	if (rc != 0) {
@@ -99,7 +100,7 @@ int do_tpm2_info(struct cmd_tbl *cmdtp, int flag,
 				   caps.fwVerMajor, caps.fwVerMinor, caps.fwVerVendor);
 			printf("  Type: 0x%08X\n", caps.tpmType);
 		}
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 	}
 
 	if (rc != 0) {
@@ -137,7 +138,7 @@ int do_tpm2_state(struct cmd_tbl *cmdtp, int flag,
 			printf("  Mode: Native wolfTPM SPI\n");
 #endif
 		}
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 	}
 
 	if (rc != 0) {
@@ -158,7 +159,7 @@ int do_tpm2_init(struct cmd_tbl *cmdtp, int flag, int argc,
 		return CMD_RET_USAGE;
 
 	/* Init the TPM2 device */
-	return TPM2_Init_Device(&dev, NULL);
+	return report_return_code(TPM2_Init_Device(&dev, NULL));
 }
 
 int do_tpm2_autostart(struct cmd_tbl *cmdtp, int flag, int argc,
@@ -174,7 +175,7 @@ int do_tpm2_autostart(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	log_debug("tpm2 autostart: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 /******************************************************************************/
@@ -228,7 +229,7 @@ int do_tpm2_get_capability(struct cmd_tbl *cmdtp, int flag,
 
 	log_debug("tpm2 get_capability: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_caps(struct cmd_tbl *cmdtp, int flag,
@@ -244,7 +245,7 @@ int do_tpm2_caps(struct cmd_tbl *cmdtp, int flag,
 	/* Init the TPM2 device */
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS)
-		return rc;
+		return report_return_code(rc);
 
 	rc = wolfTPM2_GetCapabilities(&dev, &caps);
 	if (rc != TPM_RC_SUCCESS)
@@ -270,13 +271,11 @@ int do_tpm2_caps(struct cmd_tbl *cmdtp, int flag,
 	rc = TPM2_PCRs_Print();
 
 cleanup:
-	/* Only doShutdown=1: Just shut down the TPM */
-	wolfTPM2_Reset(&dev, 1, 0);
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 caps: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 #ifdef WOLFTPM_FIRMWARE_UPGRADE
@@ -370,11 +369,11 @@ fw_cleanup:
 		log_debug("Infineon firmware update failed 0x%x: %s\n",
 			rc, TPM2_GetRCString(rc));
 
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 firmware_update: rc=%d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_firmware_cancel(struct cmd_tbl *cmdtp, int flag,
@@ -405,11 +404,11 @@ int do_tpm2_firmware_cancel(struct cmd_tbl *cmdtp, int flag,
 		}
 	}
 
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 firmware_cancel: rc=%d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 #endif /* WOLFTPM_SLB9672 || WOLFTPM_SLB9673 */
 #endif /* WOLFTPM_FIRMWARE_UPGRADE */
@@ -440,7 +439,7 @@ int do_tpm2_startup(struct cmd_tbl *cmdtp, int flag,
 	/* Init the TPM2 device */
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS)
-		return rc;
+		return report_return_code(rc);
 
 	if (!strcmp(argv[1], "TPM2_SU_CLEAR")) {
 		if (doStartup == YES)
@@ -454,7 +453,7 @@ int do_tpm2_startup(struct cmd_tbl *cmdtp, int flag,
 			shutdownIn.shutdownType = TPM_SU_STATE;
 	} else {
 		log_debug("Couldn't recognize mode string: %s\n", argv[1]);
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 		return CMD_RET_FAILURE;
 	}
 
@@ -475,7 +474,7 @@ int do_tpm2_startup(struct cmd_tbl *cmdtp, int flag,
 		}
 	}
 
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	if (rc >= 0)
 		rc = 0;
@@ -483,7 +482,7 @@ int do_tpm2_startup(struct cmd_tbl *cmdtp, int flag,
 	log_debug("tpm2 startup (%s): rc = %d (%s)\n",
 		doStartup ? "startup" : "shutdown", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_selftest(struct cmd_tbl *cmdtp, int flag,
@@ -506,7 +505,7 @@ int do_tpm2_selftest(struct cmd_tbl *cmdtp, int flag,
 			fullTest = NO;
 		} else {
 			log_debug("Couldn't recognize test mode: %s\n", argv[1]);
-			wolfTPM2_Cleanup(&dev);
+			wolfTPM2_Cleanup_ex(&dev, 0);
 			return CMD_RET_FAILURE;
 		}
 
@@ -527,12 +526,12 @@ int do_tpm2_selftest(struct cmd_tbl *cmdtp, int flag,
 		}
 	}
 
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 selftest (%s): rc = %d (%s)\n",
 		fullTest ? "full" : "continue", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_clear(struct cmd_tbl *cmdtp, int flag,
@@ -568,13 +567,13 @@ int do_tpm2_clear(struct cmd_tbl *cmdtp, int flag,
 		}
 	}
 
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 clear (%s): rc = %d (%s)\n",
 		handle == TPM_RH_LOCKOUT ? "TPM2_RH_LOCKOUT" : "TPM2_RH_PLATFORM",
 		rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_pcr_extend(struct cmd_tbl *cmdtp, int flag,
@@ -627,7 +626,7 @@ int do_tpm2_pcr_extend(struct cmd_tbl *cmdtp, int flag,
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS) {
 		unmap_sysmem(digest);
-		return rc;
+		return report_return_code(rc);
 	}
 
 	/* Extend the PCR */
@@ -638,11 +637,11 @@ int do_tpm2_pcr_extend(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	unmap_sysmem(digest);
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 pcr_extend: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_pcr_read(struct cmd_tbl *cmdtp, int flag,
@@ -694,7 +693,7 @@ int do_tpm2_pcr_read(struct cmd_tbl *cmdtp, int flag,
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS) {
 		unmap_sysmem(digest);
-		return rc;
+		return report_return_code(rc);
 	}
 
 	/* Read the PCR */
@@ -705,11 +704,11 @@ int do_tpm2_pcr_read(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	unmap_sysmem(digest);
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 pcr_read: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
@@ -728,7 +727,7 @@ int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
 	/* Init the TPM2 device */
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS)
-		return rc;
+		return report_return_code(rc);
 
 	/* Setup PCR Allocation command */
 	memset(&in, 0, sizeof(in));
@@ -749,7 +748,7 @@ int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
 			PCR_SELECT_MAX);
 	} else {
 		log_debug("Couldn't recognize allocate mode: %s\n", argv[2]);
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 		return CMD_RET_USAGE;
 	}
 	log_debug("Attempting to set %s bank to %s\n",
@@ -765,8 +764,8 @@ int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
 		if (rc != TPM_RC_SUCCESS) {
 			log_debug("wolfTPM2_SetAuth failed 0x%x: %s\n", rc,
 				TPM2_GetRCString(rc));
-			wolfTPM2_Cleanup(&dev);
-			return rc;
+			wolfTPM2_Cleanup_ex(&dev, 0);
+			return report_return_code(rc);
 		}
 	}
 
@@ -782,7 +781,7 @@ int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
 	printf("\nCurrent PCR state:\n");
 	TPM2_PCRs_Print();
 
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	printf("Allocation Success: %s\n",
 		out.allocationSuccess ? "YES" : "NO");
@@ -790,7 +789,7 @@ int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
 		TPM2_GetAlgName(in.pcrAllocation.pcrSelections[0].hash),
 		argv[2], rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 /*
@@ -805,19 +804,24 @@ static int TPM2_PCR_SetAuth(int argc, char *const argv[],
 	WOLFTPM2_DEV dev;
 	WOLFTPM2_SESSION session;
 	TPM2B_AUTH auth;
-	const char *pw = (argc < 4) ? NULL : argv[3];
-	const char *key = argv[2];
-	const ssize_t key_sz = strlen(key);
-	u32 pcrIndex = simple_strtoul(argv[1], NULL, 0);
+	const char *pw;
+	const char *key;
+	ssize_t key_sz;
+	u32 pcrIndex;
 
 	/* Need 3-4 args: command + pcr + auth + [platform_auth] */
 	if (argc < 3 || argc > 4)
 		return CMD_RET_USAGE;
 
+	pw = (argc < 4) ? NULL : argv[3];
+	key = argv[2];
+	key_sz = strlen(key);
+	pcrIndex = simple_strtoul(argv[1], NULL, 0);
+
 	/* Init the TPM2 device for value/policy */
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS)
-		return rc;
+		return report_return_code(rc);
 
 	/* Start the session */
 	rc = wolfTPM2_StartSession(&dev, &session, NULL, NULL,
@@ -825,8 +829,8 @@ static int TPM2_PCR_SetAuth(int argc, char *const argv[],
 	if (rc != TPM_RC_SUCCESS) {
 		log_debug("wolfTPM2_StartSession failed 0x%x: %s\n", rc,
 			TPM2_GetRCString(rc));
-		wolfTPM2_Cleanup(&dev);
-		return rc;
+		wolfTPM2_Cleanup_ex(&dev, 0);
+		return report_return_code(rc);
 	}
 
 	/* Set the platform auth if provided */
@@ -842,8 +846,8 @@ static int TPM2_PCR_SetAuth(int argc, char *const argv[],
 			log_debug("wolfTPM2_SetAuth failed 0x%x: %s\n", rc,
 				TPM2_GetRCString(rc));
 			wolfTPM2_UnloadHandle(&dev, &session.handle);
-			wolfTPM2_Cleanup(&dev);
-			return rc;
+			wolfTPM2_Cleanup_ex(&dev, 0);
+			return report_return_code(rc);
 		}
 	}
 
@@ -882,12 +886,12 @@ static int TPM2_PCR_SetAuth(int argc, char *const argv[],
 	}
 
 	wolfTPM2_UnloadHandle(&dev, &session.handle);
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 set_auth %s: rc = %d (%s)\n",
 		isPolicy ? "Policy" : "Value", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_pcr_setauthpolicy(struct cmd_tbl *cmdtp, int flag,
@@ -922,7 +926,7 @@ int do_tpm2_change_auth(struct cmd_tbl *cmdtp, int flag,
 	/* Init the TPM2 device */
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc != TPM_RC_SUCCESS)
-		return rc;
+		return report_return_code(rc);
 
 	memset(&in, 0, sizeof(in));
 
@@ -936,14 +940,14 @@ int do_tpm2_change_auth(struct cmd_tbl *cmdtp, int flag,
 	else if (!strcmp(argv[1], "TPM2_RH_PLATFORM"))
 		in.authHandle = TPM_RH_PLATFORM;
 	else {
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 		return CMD_RET_USAGE;
 	}
 
 	/* Validate password length if provided */
 	if (newpw_sz > TPM_SHA256_DIGEST_SIZE ||
 		oldpw_sz > TPM_SHA256_DIGEST_SIZE) {
-		wolfTPM2_Cleanup(&dev);
+		wolfTPM2_Cleanup_ex(&dev, 0);
 		return -EINVAL;
 	}
 
@@ -953,8 +957,8 @@ int do_tpm2_change_auth(struct cmd_tbl *cmdtp, int flag,
 	if (rc != TPM_RC_SUCCESS) {
 		log_debug("wolfTPM2_StartSession failed 0x%x: %s\n", rc,
 			TPM2_GetRCString(rc));
-		wolfTPM2_Cleanup(&dev);
-		return rc;
+		wolfTPM2_Cleanup_ex(&dev, 0);
+		return report_return_code(rc);
 	}
 
 	/* If old password exists then set it as the current auth */
@@ -969,8 +973,8 @@ int do_tpm2_change_auth(struct cmd_tbl *cmdtp, int flag,
 			log_debug("wolfTPM2_SetAuthPassword failed 0x%x: %s\n", rc,
 				TPM2_GetRCString(rc));
 			wolfTPM2_UnloadHandle(&dev, &session.handle);
-			wolfTPM2_Cleanup(&dev);
-			return rc;
+			wolfTPM2_Cleanup_ex(&dev, 0);
+			return report_return_code(rc);
 		}
 	}
 
@@ -989,11 +993,11 @@ int do_tpm2_change_auth(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	wolfTPM2_UnloadHandle(&dev, &session.handle);
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 change_auth: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 #else /* WOLFTPM2_NO_WOLFCRYPT */
 int do_tpm2_change_auth(struct cmd_tbl *cmdtp, int flag,
@@ -1033,11 +1037,11 @@ int do_tpm2_pcr_print(struct cmd_tbl *cmdtp, int flag, int argc, char *const arg
 		/* Print the current PCR state */
 		TPM2_PCRs_Print();
 	}
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 pcr_print: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 static void tpm2_print_name(const char *label, const byte *name, word32 nameSz)
@@ -1121,7 +1125,7 @@ int do_tpm2_nv_read_cert(struct cmd_tbl *cmdtp, int flag, int argc,
 	} else {
 		free(buf);
 	}
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	if (rc != TPM_RC_SUCCESS) {
 		printf("Couldn't read certificate from NV index 0x%08x (rc=%d: %s)\n",
@@ -1172,11 +1176,11 @@ int do_tpm2_dam_reset(struct cmd_tbl *cmdtp, int flag,
 		log_debug("TPM2_Dam_Reset: Result = 0x%x (%s)\n", rc,
 			TPM2_GetRCString(rc));
 	}
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 dam_reset: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 int do_tpm2_dam_parameters(struct cmd_tbl *cmdtp, int flag,
@@ -1235,11 +1239,11 @@ int do_tpm2_dam_parameters(struct cmd_tbl *cmdtp, int flag,
 		printf("  recoveryTime: %u\n", in.newRecoveryTime);
 		printf("  lockoutRecovery: %u\n", in.lockoutRecovery);
 	}
-	wolfTPM2_Cleanup(&dev);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 dam_parameters: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
-	return rc;
+	return report_return_code(rc);
 }
 
 #endif /* !WOLFTPM2_NO_WRAPPER */
