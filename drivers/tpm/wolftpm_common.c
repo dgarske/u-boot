@@ -17,6 +17,8 @@
 #include <string.h>
 #include <log.h>
 #include <hash.h>
+#include <tpm-common.h>
+#include <linux/errno.h>
 #include <examples/wrap/wrap_test.h>
 
 #ifndef WOLFTPM2_NO_WRAPPER
@@ -123,6 +125,25 @@ int TPM2_PCRs_Print(void)
 int TPM2_Init_Device(WOLFTPM2_DEV *dev, void *userCtx)
 {
 	int rc;
+#ifdef WOLFTPM_LINUX_DEV
+	struct udevice *udev;
+
+	/*
+	 * wolfTPM sends commands with tpm_xfer(), so open the U-Boot TPM
+	 * device first, as tpm_init() does for the native stack. -EBUSY means
+	 * it is already open.
+	 */
+	rc = get_tpm(&udev);
+	if (!rc) {
+		rc = tpm_init(udev);
+		if (rc == -EBUSY)
+			rc = 0;
+	}
+	if (rc) {
+		log_debug("tpm2 init: no TPM device (%d)\n", rc);
+		return TPM_RC_FAILURE;
+	}
+#endif
 
 	/* Use TPM2_IoCb callback for packet-level access */
 	rc = wolfTPM2_Init(dev, TPM2_IoCb, userCtx);
