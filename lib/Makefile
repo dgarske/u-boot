@@ -81,6 +81,7 @@ obj-y += wolftpm/src/tpm2_util.o
 obj-y += wolftpm/src/tpm2_crypto.o
 obj-y += wolftpm/src/tpm2_asn.o
 obj-y += wolftpm.o
+obj-y += tpm-cisco.o
 endif
 endif
 
