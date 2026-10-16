@@ -27,6 +27,7 @@
 #include "tpm-user-utils.h"
 #include <vsprintf.h>
 #include <mapmem.h>
+#include <asm/unaligned.h>
 #include <env.h>
 #include <malloc.h>
 #include <errno.h>
@@ -189,20 +190,34 @@ int do_tpm2_autostart(struct cmd_tbl *cmdtp, int flag, int argc,
 int do_tpm2_get_capability(struct cmd_tbl *cmdtp, int flag,
 	int argc, char *const argv[])
 {
+	WOLFTPM2_DEV dev;
 	GetCapability_In  in;
 	GetCapability_Out out;
-	u32 capability, property, rc;
+	TPML_TAGGED_TPM_PROPERTY *props;
+	u32 capability, property;
 	u8 *data;
 	size_t count;
-	int i, j;
+	int rc, i;
 
 	if (argc != 5)
 		return CMD_RET_USAGE;
 
 	capability = simple_strtoul(argv[1], NULL, 0);
 	property = simple_strtoul(argv[2], NULL, 0);
-	data = map_sysmem(simple_strtoul(argv[3], NULL, 0), 0);
 	count = simple_strtoul(argv[4], NULL, 0);
+
+	/* Only TPM properties have a fixed layout to copy out and print */
+	if (capability != TPM_CAP_TPM_PROPERTIES) {
+		printf("Only capability 0x%x (TPM_CAP_TPM_PROPERTIES) is supported\n",
+		       TPM_CAP_TPM_PROPERTIES);
+		return CMD_RET_FAILURE;
+	}
+	if (count > MAX_TPM_PROPERTIES)
+		count = MAX_TPM_PROPERTIES;
+
+	rc = TPM2_Init_Device(&dev, NULL);
+	if (rc != TPM_RC_SUCCESS)
+		return report_return_code(rc);
 
 	memset(&in, 0, sizeof(in));
 	memset(&out, 0, sizeof(out));
@@ -211,21 +226,28 @@ int do_tpm2_get_capability(struct cmd_tbl *cmdtp, int flag,
 	in.propertyCount = count;
 	rc = TPM2_GetCapability(&in, &out);
 	if (!rc) {
-		memcpy(data, &out.capabilityData.data, sizeof(out.capabilityData.data));
+		props = &out.capabilityData.data.tpmProperties;
+		if (props->count < count)
+			count = props->count;
 
+		/* Same layout as the native backend: be32 count, then pairs */
+		data = map_sysmem(simple_strtoul(argv[3], NULL, 0),
+				  sizeof(u32) + count * 8);
+		put_unaligned_be32(count, data);
 		printf("Capabilities read from TPM:\n");
 		for (i = 0; i < count; i++) {
-			printf("Property 0x");
-			for (j = 0; j < 4; j++)
-				printf("%02x", data[(i * 8) + j + sizeof(u32)]);
-			printf(": 0x");
-			for (j = 4; j < 8; j++)
-				printf("%02x", data[(i * 8) + j + sizeof(u32)]);
-			printf("\n");
+			put_unaligned_be32(props->tpmProperty[i].property,
+					   data + sizeof(u32) + i * 8);
+			put_unaligned_be32(props->tpmProperty[i].value,
+					   data + sizeof(u32) + i * 8 + 4);
+			printf("Property 0x%08x: 0x%08x\n",
+			       props->tpmProperty[i].property,
+			       props->tpmProperty[i].value);
 		}
+		unmap_sysmem(data);
 	}
 
-	unmap_sysmem(data);
+	wolfTPM2_Cleanup_ex(&dev, 0);
 
 	log_debug("tpm2 get_capability: rc = %d (%s)\n", rc, TPM2_GetRCString(rc));
 
@@ -391,6 +413,7 @@ int do_tpm2_firmware_cancel(struct cmd_tbl *cmdtp, int flag,
 	rc = TPM2_Init_Device(&dev, NULL);
 	if (rc == TPM_RC_SUCCESS) {
 		/* Setup command size in header */
+		memset(cmd, 0, sizeof(cmd));
 		val16 = TPM2_HEADER_SIZE + 2;
 		memcpy(cmd, &val16, sizeof(val16));
 		val16 = 0;
@@ -476,8 +499,9 @@ int do_tpm2_startup(struct cmd_tbl *cmdtp, int flag,
 
 	wolfTPM2_Cleanup_ex(&dev, 0);
 
-	if (rc >= 0)
-		rc = 0;
+	/* TPM_RC_INITIALIZE = Already started */
+	if (doStartup == YES && rc == TPM_RC_INITIALIZE)
+		rc = TPM_RC_SUCCESS;
 
 	log_debug("tpm2 startup (%s): rc = %d (%s)\n",
 		doStartup ? "startup" : "shutdown", rc, TPM2_GetRCString(rc));
@@ -491,6 +515,7 @@ int do_tpm2_selftest(struct cmd_tbl *cmdtp, int flag,
 	int rc;
 	WOLFTPM2_DEV dev;
 	TPMI_YES_NO fullTest = YES;
+	SelfTest_In selfTestIn;
 
 	/* Need 2 arg: command + type */
 	if (argc != 2)
@@ -509,20 +534,12 @@ int do_tpm2_selftest(struct cmd_tbl *cmdtp, int flag,
 			return CMD_RET_FAILURE;
 		}
 
-		/* full test */
-		if (fullTest == YES) {
-			rc = wolfTPM2_SelfTest(&dev);
-			if (rc != TPM_RC_SUCCESS) {
-				log_debug("TPM2 Self Test: Result = 0x%x (%s)\n", rc,
-					TPM2_GetRCString(rc));
-			}
-		/* continue test */
-		} else {
-			rc = wolfTPM2_SelfTest(&dev);
-			if (rc != TPM_RC_SUCCESS) {
-				log_debug("TPM2 Self Test: Result = 0x%x (%s)\n", rc,
-					TPM2_GetRCString(rc));
-			}
+		/* fullTest NO only tests algorithms not yet tested */
+		selfTestIn.fullTest = fullTest;
+		rc = TPM2_SelfTest(&selfTestIn);
+		if (rc != TPM_RC_SUCCESS) {
+			log_debug("TPM2 Self Test: Result = 0x%x (%s)\n", rc,
+				TPM2_GetRCString(rc));
 		}
 	}
 
@@ -757,6 +774,11 @@ int do_tpm2_pcr_allocate(struct cmd_tbl *cmdtp, int flag,
 
 	/* Set auth password if provided */
 	if (argc == 4) {
+		if (strlen(argv[3]) > sizeof(auth.buffer)) {
+			printf("Error: Password too long\n");
+			wolfTPM2_Cleanup_ex(&dev, 0);
+			return CMD_RET_FAILURE;
+		}
 		memset(&auth, 0, sizeof(auth));
 		auth.size = strlen(argv[3]);
 		memcpy(auth.buffer, argv[3], auth.size);
@@ -817,6 +839,12 @@ static int TPM2_PCR_SetAuth(int argc, char *const argv[],
 	key = argv[2];
 	key_sz = strlen(key);
 	pcrIndex = simple_strtoul(argv[1], NULL, 0);
+
+	if ((size_t)key_sz > sizeof(((TPM2B_AUTH *)0)->buffer) ||
+	    (pw && strlen(pw) > sizeof(((TPM2B_AUTH *)0)->buffer))) {
+		printf("Error: Key or password too long\n");
+		return CMD_RET_FAILURE;
+	}
 
 	/* Init the TPM2 device for value/policy */
 	rc = TPM2_Init_Device(&dev, NULL);
